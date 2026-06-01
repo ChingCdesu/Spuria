@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/signaling",
+    "crates/relay",
+    "crates/client",
+]
+# The Tauri desktop client is its own cargo workspace (clients/desktop/src-tauri)
+# so it isn't pulled into `cargo build --workspace` / CI test runs.
+exclude = ["clients"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Spuria contributors"]
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# serialization / protocol
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+
+# crypto / transport
+snow = "0.9"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+# signaling transport
+tokio-tungstenite = "0.24"
+
+# admin HTTP API
+axum = "0.7"
+
+# concurrency helpers
+dashmap = "6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

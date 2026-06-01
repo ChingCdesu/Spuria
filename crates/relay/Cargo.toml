@@ -1,0 +1,27 @@
+[package]
+name = "spuria-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Spuria relay server (data plane): blind ciphertext forwarding paired by ticket"
+
+[lib]
+name = "spuria_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spuria-relay"
+path = "src/main.rs"
+
+[dependencies]
+spuria-common = { path = "../common" }
+tokio.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+dashmap.workspace = true

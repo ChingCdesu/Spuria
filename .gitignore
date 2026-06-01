@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Spuria runtime data (device keys, certs, local config)
+/data
+*.spuria-key
+
+# Test / scratch logs
+*.log
+
+# Node / Tauri (desktop client). Cargo.lock IS committed (it's an app).
+**/node_modules
+clients/desktop/src-tauri/target
+clients/desktop/src-tauri/gen
+
+.env

@@ -1,0 +1,39 @@
+# Spuria self-hosted servers (plan §7).
+#
+# Set these in a `.env` next to this file (or the environment):
+#   SPURIA_SECRET         team password clients authenticate with
+#   SPURIA_ADMIN_TOKEN    bearer token for the admin dashboard
+#   SPURIA_RELAY_PUBLIC   address clients use to reach the relay (host:port)
+#
+# Run:  docker compose -f docker/compose.yml up --build
+# Admin dashboard:  http://<host>:8088/
+
+services:
+  signaling:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BINARY: spuria-signaling
+    image: spuria-signaling
+    restart: unless-stopped
+    command:
+      - "--relay-addr=${SPURIA_RELAY_PUBLIC:-127.0.0.1:21118}"
+      - "--secret=${SPURIA_SECRET:?set SPURIA_SECRET}"
+      - "--admin-bind=0.0.0.0:8088"
+      - "--admin-token=${SPURIA_ADMIN_TOKEN:?set SPURIA_ADMIN_TOKEN}"
+    ports:
+      - "21116:21116" # WebSocket signaling
+      - "21117:21117/udp" # srflx reflection
+      - "8088:8088" # admin dashboard + API
+
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BINARY: spuria-relay
+    image: spuria-relay
+    restart: unless-stopped
+    ports:
+      - "21118:21118" # relay data plane

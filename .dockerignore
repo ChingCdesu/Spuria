@@ -1,0 +1,8 @@
+target
+data
+.git
+.github
+clients
+**/node_modules
+*.log
+*.md

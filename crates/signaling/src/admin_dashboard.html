@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Spuria Admin</title>
+<style>
+  :root { color-scheme: light dark; --gap: 14px; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+  header { display: flex; align-items: center; gap: var(--gap); padding: 12px 20px; background: #171a21; border-bottom: 1px solid #262b36; position: sticky; top: 0; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .sp { flex: 1; }
+  input[type=password], input[type=text] { background: #0f1115; border: 1px solid #333a48; color: #e6e6e6; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  button { background: #2d6cdf; color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+  button.danger { background: #b3402f; }
+  button:hover { filter: brightness(1.1); }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  .stats { display: flex; gap: var(--gap); margin-bottom: 22px; flex-wrap: wrap; }
+  .card { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 16px 20px; min-width: 130px; }
+  .card .n { font-size: 30px; font-weight: 700; }
+  .card .l { font-size: 12px; color: #9aa4b2; text-transform: uppercase; letter-spacing: .05em; }
+  section h2 { font-size: 14px; color: #9aa4b2; text-transform: uppercase; letter-spacing: .05em; margin: 26px 0 8px; }
+  table { width: 100%; border-collapse: collapse; background: #171a21; border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #262b36; font-size: 13px; }
+  th { color: #9aa4b2; font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+  .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+  .pill.relay { background: #5a3e12; color: #f3c969; }
+  .pill.p2p { background: #133a23; color: #6fd99a; }
+  #err { color: #ff8c7a; font-size: 13px; padding: 0 20px; }
+  .muted { color: #6b7686; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Spuria&nbsp;Admin</h1>
+  <span class="sp"></span>
+  <input id="token" type="password" placeholder="admin token" size="28" />
+  <button id="save">Connect</button>
+  <span id="status" class="muted"></span>
+</header>
+<div id="err"></div>
+<main>
+  <div class="stats">
+    <div class="card"><div class="n" id="s-online">–</div><div class="l">Online devices</div></div>
+    <div class="card"><div class="n" id="s-sessions">–</div><div class="l">Active sessions</div></div>
+  </div>
+
+  <section>
+    <h2>Devices</h2>
+    <table><thead><tr><th>Device ID</th><th>Public key</th><th>Uptime</th><th>Idle</th><th></th></tr></thead>
+    <tbody id="devices"><tr><td colspan="5" class="muted">—</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>Sessions</h2>
+    <table><thead><tr><th>Session</th><th>Controller</th><th>Host</th><th>Path</th><th>Age</th></tr></thead>
+    <tbody id="sessions"><tr><td colspan="5" class="muted">—</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>Audit log</h2>
+    <table><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+    <tbody id="audit"><tr><td colspan="3" class="muted">—</td></tr></tbody></table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem("spuria_admin_token") || "";
+$("token").value = token;
+
+$("save").onclick = () => {
+  token = $("token").value.trim();
+  localStorage.setItem("spuria_admin_token", token);
+  refresh();
+};
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  if (res.status === 401) throw new Error("unauthorized — check the admin token");
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+function secs(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+async function kick(id) {
+  if (!confirm("Force-disconnect device " + id + "?")) return;
+  try { await api("/api/kick", { method: "POST", body: JSON.stringify({ device_id: id }) }); refresh(); }
+  catch (e) { $("err").textContent = e.message; }
+}
+window.kick = kick;
+
+async function refresh() {
+  if (!token) { $("status").textContent = "enter token"; return; }
+  try {
+    const [stats, devices, sessions, audit] = await Promise.all([
+      api("/api/stats"), api("/api/devices"), api("/api/sessions"), api("/api/audit?limit=100"),
+    ]);
+    $("err").textContent = "";
+    $("status").textContent = "connected";
+    $("s-online").textContent = stats.online;
+    $("s-sessions").textContent = stats.sessions;
+
+    $("devices").innerHTML = devices.length ? devices.map(d => `<tr>
+      <td class="mono">${esc(d.device_id)}</td>
+      <td class="mono muted">${esc(d.noise_pubkey)}…</td>
+      <td>${secs(d.uptime_secs)}</td>
+      <td>${secs(d.idle_secs)}</td>
+      <td><button class="danger" onclick="kick('${esc(d.device_id)}')">Kick</button></td>
+    </tr>`).join("") : `<tr><td colspan="5" class="muted">no devices online</td></tr>`;
+
+    $("sessions").innerHTML = sessions.length ? sessions.map(s => `<tr>
+      <td class="mono">${esc(s.session_id)}</td>
+      <td class="mono">${esc(s.controller)}</td>
+      <td class="mono">${esc(s.host)}</td>
+      <td><span class="pill ${s.relayed ? "relay" : "p2p"}">${s.relayed ? "relay" : "p2p/direct"}</span></td>
+      <td>${secs(s.age_secs)}</td>
+    </tr>`).join("") : `<tr><td colspan="5" class="muted">no active sessions</td></tr>`;
+
+    $("audit").innerHTML = audit.length ? audit.map(a => `<tr>
+      <td class="mono muted">${new Date(a.ts_ms).toLocaleTimeString()}</td>
+      <td>${esc(a.kind)}</td>
+      <td class="mono">${esc(a.detail)}</td>
+    </tr>`).join("") : `<tr><td colspan="3" class="muted">no events</td></tr>`;
+  } catch (e) {
+    $("err").textContent = e.message;
+    $("status").textContent = "error";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

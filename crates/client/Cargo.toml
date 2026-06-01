@@ -1,0 +1,39 @@
+[package]
+name = "spuria-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Spuria tunnel client (controller + host roles): NAT traversal, QUIC/relay tunnel, RDP bridging"
+
+[lib]
+name = "spuria_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spuria"
+path = "src/main.rs"
+
+[dependencies]
+spuria-common = { path = "../common" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+spuria-signaling = { path = "../signaling" }
+spuria-relay = { path = "../relay" }
