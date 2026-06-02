@@ -76,6 +76,8 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     /// Skip the QUIC P2P attempt and use the relay directly.
     pub force_relay: bool,
+    /// Enable RDP UDP multitransport over the QUIC datagram channel (P3).
+    pub enable_udp: bool,
     /// Optional channel for UI status events.
     pub events: Option<UnboundedSender<ClientEvent>>,
 }
@@ -90,6 +92,7 @@ struct Ctx {
     rdp_addr: SocketAddr,
     listen_addr: SocketAddr,
     force_relay: bool,
+    enable_udp: bool,
     events: Option<UnboundedSender<ClientEvent>>,
 }
 
@@ -137,6 +140,7 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         rdp_addr: cfg.rdp_addr,
         listen_addr: cfg.listen_addr,
         force_relay: cfg.force_relay,
+        enable_udp: cfg.enable_udp,
         events: cfg.events.clone(),
     });
 
@@ -348,8 +352,8 @@ async fn run_session(
         }),
     }
     let result = match ctx.role {
-        Role::Host => rdp::serve_host(tunnel, ctx.rdp_addr).await,
-        Role::Controller => rdp::serve_controller(tunnel, ctx.listen_addr).await,
+        Role::Host => rdp::serve_host(tunnel, ctx.rdp_addr, ctx.enable_udp).await,
+        Role::Controller => rdp::serve_controller(tunnel, ctx.listen_addr, ctx.enable_udp).await,
     };
 
     ctx.signaling.send(ClientMsg::Bye { session_id });

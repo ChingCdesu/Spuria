@@ -44,3 +44,18 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: test
         run: cargo test --workspace
+
+  frontend:
+    name: frontend build (React/Vite/Radix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: desktop client UI (tsc + vite build)
+        working-directory: clients/desktop
+        run: npm install && npm run build
+      - name: admin dashboard UI (tsc + vite singlefile build)
+        working-directory: crates/signaling/admin-ui
+        run: npm install && npm run build

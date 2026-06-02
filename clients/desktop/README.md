@@ -1,18 +1,24 @@
-# Spuria Desktop Client (Tauri)
+# Spuria Desktop Client (Tauri + React)
 
 A GUI front-end over the `spuria-client` library — both **controller (主控)** and
 **host (被控)** roles, no CLI required. The Rust backend ([`src-tauri/src/main.rs`](src-tauri/src/main.rs))
-drives the same `app::run` state machine as the CLI and forwards
-`ClientEvent`s to the web frontend ([`ui/`](ui/)).
+drives the same `app::run` state machine as the CLI and forwards `ClientEvent`s
+to the frontend.
+
+**Tech stack:** React + Vite + TypeScript + [Radix UI Themes](https://www.radix-ui.com/themes).
+Source in [`src/`](src/); the layout is RustDesk-inspired.
 
 The UI has two pages:
 
-- **Connect** — per-connection inputs (role, peer id, local listener/RDP target,
-  force-relay) and live status/log.
-- **Settings** — the **global** signaling server, reflect (srflx) address and
-  team secret. These are saved to the local computer in `settings.json` under
-  the OS app-data dir (via the `save_settings`/`get_settings` backend commands)
-  and shared across all connections — not re-entered per connect.
+- **Home** — a *This Device* card (your ID + copy, local RDP target, "Allow
+  remote control" → host role) and a *Control Remote Device* card (peer ID,
+  local listener, force-relay → controller role), plus a live activity log.
+- **Settings** — global, persisted config in sections: **Network** (signaling
+  server, reflect address), **Security** (team secret), **Connection defaults**
+  (listener/RDP target, force-relay, UDP multitransport), **Appearance** (theme),
+  **Updates**, **About** (version, device id). Saved to the local computer in
+  `settings.json` under the OS app-data dir via the `save_settings`/`get_settings`
+  backend commands, shared across all connections.
 
 ## Prerequisites
 
@@ -25,23 +31,25 @@ The UI has two pages:
 ```sh
 cd clients/desktop
 npm install
-npm run dev        # tauri dev — hot window, live logs
+npm run tauri dev    # Vite dev server + Tauri window, hot reload
+# or just the web UI in a browser (no Tauri APIs): npm run dev
 ```
 
 ## Build the MSI
 
 ```sh
 cd clients/desktop
-npm run build      # -> src-tauri/target/release/bundle/msi/Spuria_<ver>_x64_en-US.msi
+npm run tauri build  # runs `npm run build` (tsc + vite) then bundles
+#   -> src-tauri/target/release/bundle/msi/Spuria_<ver>_x64_en-US.msi
 ```
 
-The frontend is static (no bundler): `tauri.conf.json` points `frontendDist` at
-[`ui/`](ui/) and `withGlobalTauri` exposes `window.__TAURI__`.
+`tauri.conf.json` runs `npm run dev`/`npm run build` (Vite) via
+`beforeDevCommand`/`beforeBuildCommand` and bundles `dist/`.
 
 > `createUpdaterArtifacts` is on, so a release build also signs the updater
 > bundle and needs the `TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]` env vars (below).
 > For a quick **unsigned** local MSI, build just that target:
-> `npm run build -- --bundles msi`. CI signs the full set on tagged releases.
+> `npm run tauri build -- --bundles msi`. CI signs the full set on tagged releases.
 
 ## Auto-update
 

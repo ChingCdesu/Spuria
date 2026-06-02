@@ -9,6 +9,11 @@
 # Test / scratch logs
 *.log
 
+# Node / frontend build
+node_modules/
+clients/desktop/dist/
+crates/signaling/admin-ui/dist/
+
 # Node / Tauri (desktop client). Cargo.lock IS committed (it's an app).
 **/node_modules
 clients/desktop/src-tauri/target

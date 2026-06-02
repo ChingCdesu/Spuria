@@ -142,6 +142,14 @@ spuria-signaling --secret team-secret --relay-addr <relay-public:21118> \
 - **指标**:`GET /metrics` 输出 Prometheus 文本(`spuria_online_devices`、`spuria_active_sessions`)。
 - **鉴权**:所有 `/api/*` 与 `/metrics` 需 `Authorization: Bearer <admin-token>`;未设 token 则不启动管理服务。
 
+管理网页本身是 **React + Vite + Radix UI** 应用(源码 [`crates/signaling/admin-ui/`](crates/signaling/admin-ui/)),
+经 `vite-plugin-singlefile` 构建为单个内联 HTML 并 `include_str!` 嵌入信令二进制——无需额外静态资源服务:
+
+```sh
+cd crates/signaling/admin-ui
+npm install && npm run build   # 重新生成 crates/signaling/src/admin_dashboard.html(已提交)
+```
+
 > 进阶服务端参数:`--auth-file <file>`(每设备 `device_id:token` 鉴权,优先于 `--secret`)、
 > `--max-conn-per-sec <n>`(每源 IP 连接限流)。`spuria-relay` 同样支持 `--max-conn-per-sec`。
 

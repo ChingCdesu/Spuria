@@ -124,6 +124,7 @@ async fn run_path(force_relay: bool) {
         listen_addr: local(0),
         data_dir: host_dir,
         force_relay,
+        enable_udp: true,
         events: Some(host_tx),
     }));
     assert!(
@@ -151,6 +152,7 @@ async fn run_path(force_relay: bool) {
         listen_addr: local(listen),
         data_dir: ctrl_dir,
         force_relay,
+        enable_udp: true,
         events: Some(ctrl_tx),
     }));
 

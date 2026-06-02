@@ -1,0 +1,31 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+/* Big, copyable device id on the home card. */
+.device-id {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 28px;
+  letter-spacing: 0.06em;
+  user-select: all;
+}
+
+/* Scrollable activity log. */
+.logbox {
+  height: 180px;
+  overflow: auto;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.logbox .t {
+  opacity: 0.5;
+  margin-right: 8px;
+}

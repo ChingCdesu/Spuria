@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long, env = "SPURIA_FORCE_RELAY")]
     force_relay: bool,
 
+    /// Disable RDP UDP multitransport (no QUIC datagram forwarding).
+    #[arg(long, env = "SPURIA_NO_UDP")]
+    no_udp: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -102,6 +106,7 @@ async fn main() -> Result<()> {
         listen_addr,
         data_dir: cli.data_dir,
         force_relay: cli.force_relay,
+        enable_udp: !cli.no_udp,
         events: None,
     })
     .await

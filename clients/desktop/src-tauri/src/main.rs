@@ -23,12 +23,24 @@ struct AppState {
 }
 
 /// Global, persisted client configuration — edited on the Settings page and
-/// stored in `settings.json` under the app data dir.
+/// stored in `settings.json` under the app data dir. `#[serde(default)]` keeps
+/// old files loadable as new fields are added.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct Settings {
+    // Network
     server: String,
     reflect: String,
     secret: String,
+    // Connection defaults
+    default_listen: String,
+    default_rdp: String,
+    force_relay: bool,
+    enable_udp: bool,
+    // Appearance: "system" | "light" | "dark"
+    theme: String,
+    // Updates
+    auto_check_updates: bool,
 }
 
 impl Default for Settings {
@@ -37,8 +49,21 @@ impl Default for Settings {
             server: "ws://127.0.0.1:21116".into(),
             reflect: "127.0.0.1:21117".into(),
             secret: String::new(),
+            default_listen: "127.0.0.1:33389".into(),
+            default_rdp: "127.0.0.1:3389".into(),
+            force_relay: false,
+            enable_udp: true,
+            theme: "system".into(),
+            auto_check_updates: true,
         }
     }
+}
+
+/// App metadata for the Settings → About section.
+#[derive(Serialize)]
+struct AppInfo {
+    version: String,
+    device_id: String,
 }
 
 /// Per-connection options sent from the frontend's Connect form. Global
@@ -113,6 +138,15 @@ fn ensure_device_id(app: AppHandle) -> Result<String, String> {
     resolve_device_id(&app, None)
 }
 
+/// App version + this device's id, for the Settings → About section.
+#[tauri::command]
+fn get_app_info(app: AppHandle) -> Result<AppInfo, String> {
+    Ok(AppInfo {
+        version: app.package_info().version.to_string(),
+        device_id: resolve_device_id(&app, None)?,
+    })
+}
+
 #[tauri::command]
 async fn connect(
     app: AppHandle,
@@ -132,16 +166,20 @@ async fn connect(
         .trim()
         .parse()
         .map_err(|e| format!("bad reflect address in settings: {e}"))?;
-    let listen_addr: SocketAddr = opts
+    let listen_str = opts
         .listen
-        .as_deref()
-        .unwrap_or("127.0.0.1:33389")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| settings.default_listen.clone());
+    let listen_addr: SocketAddr = listen_str
+        .trim()
         .parse()
         .map_err(|e| format!("bad listen address: {e}"))?;
-    let rdp_addr: SocketAddr = opts
+    let rdp_str = opts
         .rdp
-        .as_deref()
-        .unwrap_or("127.0.0.1:3389")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| settings.default_rdp.clone());
+    let rdp_addr: SocketAddr = rdp_str
+        .trim()
         .parse()
         .map_err(|e| format!("bad rdp address: {e}"))?;
     let device_id = resolve_device_id(&app, opts.device_id)?;
@@ -176,6 +214,7 @@ async fn connect(
         listen_addr,
         data_dir: data_dir(&app)?,
         force_relay: opts.force_relay,
+        enable_udp: settings.enable_udp,
         events: Some(tx),
     };
 
@@ -229,6 +268,7 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             ensure_device_id,
+            get_app_info,
             get_settings,
             save_settings,
             connect,

@@ -26,12 +26,16 @@ use tracing::info;
 use crate::tunnel::{quic, Tunnel};
 
 /// 被控: connect to the local RDP service and bridge it onto the tunnel.
-pub async fn serve_host(tunnel: Tunnel, rdp_addr: SocketAddr) -> Result<()> {
+pub async fn serve_host(tunnel: Tunnel, rdp_addr: SocketAddr, enable_udp: bool) -> Result<()> {
     let local = TcpStream::connect(rdp_addr)
         .await
         .with_context(|| format!("connecting to local RDP service at {rdp_addr}"))?;
-    info!(%rdp_addr, path = ?tunnel.path(), "host: bridging tunnel to local RDP");
-    let udp = tunnel.datagram_conn();
+    info!(%rdp_addr, path = ?tunnel.path(), enable_udp, "host: bridging tunnel to local RDP");
+    let udp = if enable_udp {
+        tunnel.datagram_conn()
+    } else {
+        None
+    };
     let reliable = tunnel.bridge(local, Role::Host);
     match udp {
         Some(conn) => tokio::select! {
@@ -43,7 +47,11 @@ pub async fn serve_host(tunnel: Tunnel, rdp_addr: SocketAddr) -> Result<()> {
 }
 
 /// 主控: bind a local listener and bridge the first RDP client over the tunnel.
-pub async fn serve_controller(tunnel: Tunnel, listen_addr: SocketAddr) -> Result<()> {
+pub async fn serve_controller(
+    tunnel: Tunnel,
+    listen_addr: SocketAddr,
+    enable_udp: bool,
+) -> Result<()> {
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("binding local RDP listener at {listen_addr}"))?;
@@ -57,7 +65,11 @@ pub async fn serve_controller(tunnel: Tunnel, listen_addr: SocketAddr) -> Result
         .await
         .context("accepting local RDP client")?;
     info!(%peer, "local RDP client connected; bridging over tunnel");
-    let udp = tunnel.datagram_conn();
+    let udp = if enable_udp {
+        tunnel.datagram_conn()
+    } else {
+        None
+    };
     let reliable = tunnel.bridge(local, Role::Controller);
     match udp {
         Some(conn) => tokio::select! {
