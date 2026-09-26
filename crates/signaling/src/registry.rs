@@ -16,11 +16,16 @@ use spuria_common::{
     candidate::SessionOffer,
     ids::DeviceId,
     protocol::{ErrorCode, ServerMsg, SessionId, Ticket},
+    relay_ticket::RelayTicketKey,
+    transport::TunnelPath,
 };
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
@@ -29,8 +34,12 @@ use tracing::{debug, info, warn};
 /// Maximum audit entries retained in memory.
 const AUDIT_CAPACITY: usize = 2000;
 
+/// Identifies one WebSocket registration, even when the device ID is reused.
+pub type ConnectionId = u64;
+
 /// A registered, online device.
 struct Device {
+    connection_id: ConnectionId,
     noise_pubkey: String,
     tx: UnboundedSender<ServerMsg>,
     /// Fires to force the connection's read loop to close (admin kick).
@@ -44,10 +53,17 @@ struct Session {
     controller: DeviceId,
     host: DeviceId,
     ticket: Option<Ticket>,
+    controller_path: Option<TunnelPath>,
+    host_path: Option<TunnelPath>,
     created_at: Instant,
 }
 
 impl Session {
+    fn path(&self) -> Option<TunnelPath> {
+        self.controller_path
+            .filter(|path| self.host_path == Some(*path))
+    }
+
     /// The other participant relative to `me`.
     fn peer_of(&self, me: &DeviceId) -> Option<&DeviceId> {
         if me == &self.controller {
@@ -77,6 +93,8 @@ pub struct SessionInfo {
     pub controller: String,
     pub host: String,
     pub relayed: bool,
+    /// Established path reported by both participants, or unknown/pending.
+    pub path: Option<TunnelPath>,
     pub age_secs: u64,
 }
 
@@ -93,16 +111,23 @@ pub struct Registry {
     sessions: DashMap<SessionId, Session>,
     audit: Mutex<VecDeque<AuditEntry>>,
     relay_addr: SocketAddr,
+    relay_key: RelayTicketKey,
+    next_connection_id: AtomicU64,
+    /// Serialize registration replacement, cleanup, and authenticated dispatch.
+    lifecycle: Mutex<()>,
 }
 
 impl Registry {
-    pub fn new(relay_addr: SocketAddr) -> Self {
-        Self {
+    pub fn new(relay_addr: SocketAddr, relay_secret: &str) -> spuria_common::Result<Self> {
+        Ok(Self {
             devices: DashMap::new(),
             sessions: DashMap::new(),
             audit: Mutex::new(VecDeque::with_capacity(256)),
             relay_addr,
-        }
+            relay_key: RelayTicketKey::new(relay_secret)?,
+            next_connection_id: AtomicU64::new(1),
+            lifecycle: Mutex::new(()),
+        })
     }
 
     pub fn online_count(&self) -> usize {
@@ -120,14 +145,14 @@ impl Registry {
         noise_pubkey: String,
         tx: UnboundedSender<ServerMsg>,
         kick: oneshot::Sender<()>,
-    ) {
-        if self.devices.contains_key(&id) {
-            debug!(%id, "replacing existing registration");
-        }
+    ) -> ConnectionId {
+        let _guard = self.lifecycle.lock().unwrap();
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
-        self.devices.insert(
+        let replaced = self.devices.insert(
             id.clone(),
             Device {
+                connection_id,
                 noise_pubkey,
                 tx,
                 kick: Some(kick),
@@ -135,8 +160,34 @@ impl Registry {
                 last_seen: now,
             },
         );
+        if let Some(mut previous) = replaced {
+            debug!(%id, "replacing existing registration");
+            if let Some(kick) = previous.kick.take() {
+                let _ = kick.send(());
+            }
+            self.remove_device_sessions(&id);
+        }
         info!(%id, online = self.devices.len(), "device registered");
         self.audit("register", id.as_str());
+        connection_id
+    }
+
+    /// Run one message only while its registration is still current. Holding
+    /// the lifecycle guard prevents replacement between validation and action.
+    pub fn with_connection(
+        &self,
+        id: &DeviceId,
+        connection_id: ConnectionId,
+        action: impl FnOnce(),
+    ) {
+        let _guard = self.lifecycle.lock().unwrap();
+        if self
+            .devices
+            .get(id)
+            .is_some_and(|d| d.connection_id == connection_id)
+        {
+            action();
+        }
     }
 
     pub fn touch(&self, id: &DeviceId) {
@@ -147,12 +198,21 @@ impl Registry {
 
     /// Remove a device and tear down any sessions it was part of, notifying the
     /// surviving peer.
-    pub fn unregister(&self, id: &DeviceId) {
-        if self.devices.remove(id).is_none() {
+    pub fn unregister(&self, id: &DeviceId, connection_id: ConnectionId) {
+        let _guard = self.lifecycle.lock().unwrap();
+        if self
+            .devices
+            .remove_if(id, |_, d| d.connection_id == connection_id)
+            .is_none()
+        {
             return;
         }
         info!(%id, online = self.devices.len(), "device unregistered");
         self.audit("unregister", id.as_str());
+        self.remove_device_sessions(id);
+    }
+
+    fn remove_device_sessions(&self, id: &DeviceId) {
         let affected: Vec<(SessionId, DeviceId)> = self
             .sessions
             .iter()
@@ -222,6 +282,8 @@ impl Registry {
                 controller: controller.clone(),
                 host: host.clone(),
                 ticket: None,
+                controller_path: None,
+                host_path: None,
                 created_at: Instant::now(),
             },
         );
@@ -279,7 +341,19 @@ impl Registry {
             warn!(%session_id, %requester, "relay request from non-participant");
             return;
         }
-        let ticket = s.ticket.get_or_insert_with(|| rand_token(16)).clone();
+        let ticket = match &s.ticket {
+            Some(ticket) => ticket.clone(),
+            None => match self.relay_key.issue() {
+                Ok(ticket) => {
+                    s.ticket = Some(ticket.clone());
+                    ticket
+                }
+                Err(error) => {
+                    warn!(%session_id, %error, "could not issue relay ticket");
+                    return;
+                }
+            },
+        };
         let (controller, host) = (s.controller.clone(), s.host.clone());
         drop(s); // release the lock before sending
 
@@ -296,7 +370,10 @@ impl Registry {
 
     /// Explicitly close a session, notifying the peer of the closer.
     pub fn close_session(&self, closer: &DeviceId, session_id: &SessionId) {
-        if let Some((_, s)) = self.sessions.remove(session_id) {
+        if let Some((_, s)) = self
+            .sessions
+            .remove_if(session_id, |_, s| s.peer_of(closer).is_some())
+        {
             if let Some(peer) = s.peer_of(closer) {
                 self.send(
                     peer,
@@ -305,6 +382,17 @@ impl Registry {
                     },
                 );
             }
+        }
+    }
+
+    pub fn record_path(&self, reporter: &DeviceId, session_id: &SessionId, path: TunnelPath) {
+        let Some(mut session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if reporter == &session.controller {
+            session.controller_path = Some(path);
+        } else if reporter == &session.host {
+            session.host_path = Some(path);
         }
     }
 
@@ -329,7 +417,8 @@ impl Registry {
                 session_id: e.key().clone(),
                 controller: e.value().controller.to_string(),
                 host: e.value().host.to_string(),
-                relayed: e.value().ticket.is_some(),
+                relayed: e.value().path() == Some(TunnelPath::Relay),
+                path: e.value().path(),
                 age_secs: e.value().created_at.elapsed().as_secs(),
             })
             .collect()
@@ -384,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_pairing_and_relay_flow() {
-        let r = Registry::new(relay());
+        let r = Registry::new(relay(), "unit-test-relay-secret-32-bytes-long").unwrap();
         let controller = DeviceId::new("ctrl");
         let host = DeviceId::new("host");
         let mut crx = add(&r, "ctrl", "ctrlpk");
@@ -449,9 +538,16 @@ mod tests {
         // Snapshots reflect the live state.
         assert_eq!(r.list_devices().len(), 2);
         assert_eq!(r.list_sessions().len(), 1);
-        assert!(r.list_sessions()[0].relayed);
+        assert!(!r.list_sessions()[0].relayed);
+        assert_eq!(r.list_sessions()[0].path, None);
+        r.record_path(&controller, &session_id, TunnelPath::P2p);
+        assert_eq!(r.list_sessions()[0].path, None);
+        r.record_path(&host, &session_id, TunnelPath::P2p);
+        assert_eq!(r.list_sessions()[0].path, Some(TunnelPath::P2p));
+        assert!(!r.list_sessions()[0].relayed);
 
-        r.unregister(&host);
+        let host_connection = r.devices.get(&host).unwrap().connection_id;
+        r.unregister(&host, host_connection);
         match crx.recv().await.unwrap() {
             ServerMsg::PeerOffline { session_id: s } => assert_eq!(s, session_id),
             other => panic!("expected peer offline, got {other:?}"),
@@ -462,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn connecting_to_offline_peer_errors() {
-        let r = Registry::new(relay());
+        let r = Registry::new(relay(), "unit-test-relay-secret-32-bytes-long").unwrap();
         let mut crx = add(&r, "ctrl", "pk");
         r.start_session(&DeviceId::new("ctrl"), &DeviceId::new("ghost"));
         match crx.recv().await.unwrap() {
@@ -473,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn kick_fires_and_audits() {
-        let r = Registry::new(relay());
+        let r = Registry::new(relay(), "unit-test-relay-secret-32-bytes-long").unwrap();
         let (tx, _rx) = unbounded_channel();
         let (ktx, krx) = oneshot::channel();
         r.register(DeviceId::new("victim"), "pk".into(), tx, ktx);
@@ -482,5 +578,63 @@ mod tests {
         // A second kick is a no-op (already taken).
         assert!(!r.kick(&DeviceId::new("victim")));
         assert!(r.recent_audit(10).iter().any(|e| e.kind == "kick"));
+    }
+
+    #[tokio::test]
+    async fn old_connection_cannot_dispatch_or_unregister_replacement() {
+        let r = Registry::new(relay(), "unit-test-relay-secret-32-bytes-long").unwrap();
+        let id = DeviceId::new("reconnecting");
+        let (old_tx, _old_rx) = unbounded_channel();
+        let (old_kick_tx, old_kick_rx) = oneshot::channel();
+        let old = r.register(id.clone(), "old".into(), old_tx, old_kick_tx);
+        let (new_tx, _new_rx) = unbounded_channel();
+        let (new_kick_tx, mut new_kick_rx) = oneshot::channel();
+        let new = r.register(id.clone(), "new".into(), new_tx, new_kick_tx);
+        assert_ne!(old, new);
+        assert!(old_kick_rx.await.is_ok());
+        r.with_connection(&id, old, || panic!("stale connection was authorized"));
+        r.unregister(&id, old);
+        assert_eq!(r.online_count(), 1);
+        assert_eq!(r.pubkey_of(&id).as_deref(), Some("new"));
+        assert!(matches!(
+            new_kick_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let called = std::cell::Cell::new(false);
+        r.with_connection(&id, new, || called.set(true));
+        assert!(called.get());
+        r.unregister(&id, new);
+        assert_eq!(r.online_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn nonparticipant_cannot_close_session_or_report_path() {
+        let r = Registry::new(relay(), "unit-test-relay-secret-32-bytes-long").unwrap();
+        let mut crx = add(&r, "ctrl", "ctrlpk");
+        let mut hrx = add(&r, "host", "hostpk");
+        let ctrl = DeviceId::new("ctrl");
+        let host = DeviceId::new("host");
+        r.start_session(&ctrl, &host);
+        let sid = match crx.recv().await.unwrap() {
+            ServerMsg::Punch { session_id, .. } => session_id,
+            other => panic!("unexpected message: {other:?}"),
+        };
+        hrx.recv().await.unwrap();
+        r.close_session(&DeviceId::new("outsider"), &sid);
+        r.record_path(&DeviceId::new("outsider"), &sid, TunnelPath::Relay);
+        assert_eq!(r.session_count(), 1);
+        assert_eq!(r.list_sessions()[0].path, None);
+        assert!(hrx.try_recv().is_err());
+        r.record_path(&ctrl, &sid, TunnelPath::Relay);
+        r.record_path(&host, &sid, TunnelPath::P2p);
+        assert_eq!(r.list_sessions()[0].path, None);
+        r.record_path(&host, &sid, TunnelPath::Relay);
+        assert!(r.list_sessions()[0].relayed);
+        r.close_session(&ctrl, &sid);
+        assert_eq!(r.session_count(), 0);
+        assert!(matches!(
+            hrx.recv().await,
+            Some(ServerMsg::PeerOffline { .. })
+        ));
     }
 }

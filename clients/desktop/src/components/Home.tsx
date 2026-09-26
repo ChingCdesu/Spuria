@@ -29,6 +29,10 @@ interface LogLine {
   msg: string;
   color: Color;
 }
+interface SessionView {
+  status: { text: string; color: Color };
+  ready: string | null;
+}
 
 export default function Home({
   settings,
@@ -43,8 +47,10 @@ export default function Home({
   const [listen, setListen] = useState(settings.default_listen);
   const [rdp, setRdp] = useState(settings.default_rdp);
   const [forceRelay, setForceRelay] = useState(settings.force_relay);
+  const previousDefaults = useRef(settings);
 
   const [busy, setBusy] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [role, setRole] = useState<Role | null>(null);
   const [status, setStatus] = useState<{ text: string; color: Color }>({
     text: "idle",
@@ -58,33 +64,61 @@ export default function Home({
     setLog((l) => [...l.slice(-250), { t: new Date().toLocaleTimeString(), msg, color }]);
 
   useEffect(() => {
+    if (busy) return;
+    // Apply saved defaults without replacing per-connection edits or a running session's values.
+    const previous = previousDefaults.current;
+    setListen((value) => value === previous.default_listen ? settings.default_listen : value);
+    setRdp((value) => value === previous.default_rdp ? settings.default_rdp : value);
+    setForceRelay((value) => value === previous.force_relay ? settings.force_relay : value);
+    previousDefaults.current = settings;
+  }, [settings, busy]);
+
+  useEffect(() => {
     logEnd.current?.scrollIntoView({ block: "end" });
   }, [log]);
 
   useEffect(() => {
+    const sessions = new Map<string, SessionView>();
+    const showSessions = (emptyColor: Color = "blue") => {
+      const current = [...sessions.values()].reverse();
+      setStatus(current[0]?.status ?? { text: "waiting for peer", color: emptyColor });
+      setReady(current.find((session) => session.ready !== null)?.ready ?? null);
+    };
+    const updateSession = (id: string, update: Partial<SessionView>) => {
+      const previous = sessions.get(id) ?? {
+        status: { text: "negotiating…", color: "amber" as const },
+        ready: null,
+      };
+      sessions.set(id, { ...previous, ...update });
+      showSessions();
+    };
     const handle = (e: ClientEvent) => {
       switch (e.kind) {
         case "registered":
           append("registered as " + e.device_id, "blue");
+          setStatus({ text: "waiting for peer", color: "blue" });
           break;
         case "session_started":
           append(`session ${e.session_id} with peer ${e.peer_id}`);
-          setStatus({ text: "negotiating…", color: "amber" });
+          updateSession(e.session_id, { status: { text: "negotiating…", color: "amber" } });
           break;
         case "tunnel_up":
           append("tunnel up via " + e.path.toUpperCase(), "green");
-          setStatus({ text: "connected · " + e.path, color: "green" });
+          updateSession(e.session_id, { status: { text: "connected · " + e.path, color: "green" } });
           break;
         case "rdp_ready":
-          setReady(e.listen_addr);
+          updateSession(e.session_id, { ready: e.listen_addr });
           append("RDP ready at " + e.listen_addr, "green");
           break;
         case "host_bridging":
           append("bridging to local RDP " + e.rdp_addr, "green");
-          setStatus({ text: "hosting", color: "green" });
+          updateSession(e.session_id, { status: { text: "hosting", color: "green" } });
           break;
         case "session_ended":
           append("session ended" + (e.error ? ": " + e.error : ""), e.error ? "amber" : "gray");
+          sessions.delete(e.session_id);
+          // The signaling client stays registered until explicitly disconnected.
+          showSessions(e.error ? "amber" : "blue");
           break;
         case "error":
           append("error: " + e.message, "red");
@@ -95,21 +129,23 @@ export default function Home({
     const subs = [
       onClientEvent(handle),
       onClientStopped(() => {
+        sessions.clear();
         setBusy(false);
         setRole(null);
         setReady(null);
-        setStatus({ text: "idle", color: "gray" });
+        setStatus((current) => current.color === "red" ? current : { text: "idle", color: "gray" });
       }),
       onClientError((m) => {
         append("fatal: " + m, "red");
         setStatus({ text: "error", color: "red" });
-        setBusy(false);
+        setReady(null);
       }),
     ];
     return () => subs.forEach((p) => p.then((u) => u()));
   }, []);
 
   const startSession = async (r: Role) => {
+    if (busy || disconnecting) return;
     if (!settings.server.trim()) {
       append("no signaling server configured — open Settings", "red");
       onOpenSettings();
@@ -142,12 +178,20 @@ export default function Home({
   };
 
   const disconnect = async () => {
-    await api.disconnect();
-    setBusy(false);
-    setRole(null);
-    setReady(null);
-    setStatus({ text: "idle", color: "gray" });
-    append("disconnected");
+    setDisconnecting(true);
+    try {
+      await api.disconnect();
+      setBusy(false);
+      setRole(null);
+      setReady(null);
+      setStatus({ text: "idle", color: "gray" });
+      append("disconnected");
+    } catch (e) {
+      append("disconnect failed: " + e, "red");
+      setStatus({ text: "disconnect failed", color: "red" });
+    } finally {
+      setDisconnecting(false);
+    }
   };
 
   const copyId = () => navigator.clipboard?.writeText(deviceId);
@@ -184,7 +228,7 @@ export default function Home({
             </label>
             <Button
               onClick={() => startSession("host")}
-              disabled={busy}
+              disabled={busy || disconnecting}
               variant="soft"
               color={role === "host" ? "green" : undefined}
             >
@@ -229,7 +273,7 @@ export default function Home({
                 Force relay (skip P2P)
               </Flex>
             </Text>
-            <Button onClick={() => startSession("controller")} disabled={busy}>
+            <Button onClick={() => startSession("controller")} disabled={busy || disconnecting}>
               <EnterIcon /> {role === "controller" ? "Connecting…" : "Connect"}
             </Button>
           </Flex>
@@ -256,8 +300,8 @@ export default function Home({
             ● {status.text}
           </Text>
           {busy && (
-            <Button size="1" color="red" variant="soft" onClick={disconnect}>
-              Disconnect
+            <Button size="1" color="red" variant="soft" onClick={disconnect} disabled={disconnecting}>
+              {disconnecting ? "Disconnecting…" : "Disconnect"}
             </Button>
           )}
           <Button size="1" variant="ghost" color="gray" onClick={() => setLog([])}>

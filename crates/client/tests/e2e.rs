@@ -91,6 +91,7 @@ async fn run_path(force_relay: bool) {
         ws_bind: local(ws),
         reflect_bind: local(reflect),
         relay_addr: local(relay),
+        relay_secret: "spuria-e2e-only-ticket-secret-32-bytes".into(),
         auth: Arc::new(AllowAllAuth),
         admin_bind: None,
         admin_token: None,
@@ -98,7 +99,12 @@ async fn run_path(force_relay: bool) {
     }));
     tokio::spawn(spuria_relay::run(spuria_relay::RelayConfig {
         bind: local(relay),
+        relay_secret: "spuria-e2e-only-ticket-secret-32-bytes".into(),
         park_timeout: Duration::from_secs(30),
+        hello_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(300),
+        max_connections: 128,
+        max_ticket_records: 256,
         max_sessions: 64,
         max_conn_per_sec: 1000.0,
     }));

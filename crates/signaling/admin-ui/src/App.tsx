@@ -28,11 +28,16 @@ const TOKEN_KEY = "spuria.admin.token";
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) ?? "");
   const [authed, setAuthed] = useState(false);
+  const logout = useCallback(() => {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken("");
+    setAuthed(false);
+  }, []);
 
   if (!authed) {
     return <Login token={token} setToken={setToken} onAuthed={() => setAuthed(true)} />;
   }
-  return <Dashboard token={token} onLogout={() => { localStorage.removeItem(TOKEN_KEY); setAuthed(false); }} />;
+  return <Dashboard token={token} onLogout={logout} />;
 }
 
 function Login({
@@ -200,8 +205,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <Table.Cell className="mono">{s.controller}</Table.Cell>
                     <Table.Cell className="mono">{s.host}</Table.Cell>
                     <Table.Cell>
-                      <Badge color={s.relayed ? "amber" : "green"} variant="soft">
-                        {s.relayed ? "relay" : "p2p"}
+                      <Badge color={s.path === "relay" ? "amber" : s.path === "p2p" ? "green" : "gray"} variant="soft">
+                        {s.path ?? "negotiating"}
                       </Badge>
                     </Table.Cell>
                     <Table.Cell>{fmtDur(s.age_secs)}</Table.Cell>

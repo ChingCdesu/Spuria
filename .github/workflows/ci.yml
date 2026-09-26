@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      e2e:
+        description: Run the process-local E2E tests
+        type: boolean
+        default: false
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -42,8 +48,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo build --workspace --all-targets
-      - name: test
-        run: cargo test --workspace
+      - name: unit tests
+        run: cargo test --workspace --lib --bins
+      - name: E2E tests (manual opt-in)
+        if: github.event_name == 'workflow_dispatch' && inputs.e2e
+        run: cargo test -p spuria-client --test e2e
 
   frontend:
     name: frontend build (React/Vite/Radix)
@@ -55,7 +64,28 @@ jobs:
           node-version: 20
       - name: desktop client UI (tsc + vite build)
         working-directory: clients/desktop
-        run: npm install && npm run build
+        run: npm ci && npm run build
       - name: admin dashboard UI (tsc + vite singlefile build)
         working-directory: crates/signaling/admin-ui
-        run: npm install && npm run build
+        run: npm ci && npm run build
+      - name: embedded dashboard is up to date
+        run: git diff --exit-code -- crates/signaling/src/admin_dashboard.html
+
+  desktop:
+    name: desktop release compile (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/desktop/src-tauri
+      - name: install desktop dependencies
+        working-directory: clients/desktop
+        run: npm ci
+      - name: compile desktop Rust and frontend without signing or packaging
+        working-directory: clients/desktop
+        run: npm run tauri -- build --no-bundle --ci

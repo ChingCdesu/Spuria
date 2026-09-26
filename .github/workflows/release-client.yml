@@ -27,7 +27,7 @@ jobs:
 
       - name: Install Tauri CLI
         working-directory: clients/desktop
-        run: npm install
+        run: npm ci
 
       - name: Build + sign + release
         uses: tauri-apps/tauri-action@v0
@@ -44,4 +44,4 @@ jobs:
           releaseDraft: true
           prerelease: false
           # MSI + updater (.msi.zip + .sig + latest.json) come from tauri.conf.json.
-          args: "--bundles msi,updater"
+          args: "--bundles msi"

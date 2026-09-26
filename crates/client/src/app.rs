@@ -13,8 +13,12 @@ use spuria_common::{
     protocol::{ClientMsg, ErrorCode, ServerMsg, SessionId},
     transport::Role,
 };
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -105,6 +109,22 @@ impl Ctx {
 }
 
 pub async fn run(cfg: AppConfig) -> Result<()> {
+    run_until_shutdown(cfg, std::future::pending()).await
+}
+
+struct SessionControl {
+    messages: UnboundedSender<ServerMsg>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+/// Run until the supplied shutdown future resolves, then release and await all
+/// sessions and signaling tasks before returning. Dropping the future also
+/// aborts its owned task groups as a last-resort cancellation guard.
+pub async fn run_until_shutdown(cfg: AppConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
+    tokio::pin!(shutdown);
+    if cfg.role == Role::Controller && cfg.peer_id.is_none() {
+        bail!("controller requires a --peer id");
+    }
     // Install the ring crypto provider for rustls/QUIC (idempotent across calls).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -119,7 +139,7 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         "starting spuria client"
     );
 
-    let (signaling, mut inbound) = signaling_client::connect(
+    let connection = signaling_client::connect(
         &cfg.server_url,
         RegisterInfo {
             device_id: cfg.device_id.clone(),
@@ -127,9 +147,13 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
             secret: cfg.secret.clone(),
             display_name: None,
         },
-    )
-    .await
-    .context("connecting to signaling")?;
+    );
+    let mut connection = tokio::select! {
+        biased;
+        _ = &mut shutdown => return Ok(()),
+        result = connection => result.context("connecting to signaling")?,
+    };
+    let signaling = connection.handle.clone();
 
     let ctx = Arc::new(Ctx {
         role: cfg.role,
@@ -144,10 +168,42 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         events: cfg.events.clone(),
     });
 
-    let mut sessions: HashMap<SessionId, UnboundedSender<ServerMsg>> = HashMap::new();
+    let mut sessions: HashMap<SessionId, SessionControl> = HashMap::new();
+    let mut tasks = JoinSet::new();
     let mut connect_sent = false;
+    let mut retry_at = None;
 
-    while let Some(msg) = inbound.recv().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Ok(sid)) = completed {
+                    sessions.remove(&sid);
+                }
+                continue;
+            }
+            _ = async {
+                match retry_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                retry_at = None;
+                if let Some(peer) = cfg.peer_id.clone() {
+                    info!(%peer, "retrying connection to peer");
+                    signaling.send(ClientMsg::Connect { peer_id: peer });
+                }
+                continue;
+            }
+            msg = connection.inbound.recv() => match msg {
+                Some(msg) => msg,
+                None => {
+                    warn!("signaling connection closed");
+                    break;
+                }
+            },
+        };
         match msg {
             ServerMsg::Registered {
                 device_id,
@@ -158,10 +214,7 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                     device_id: device_id.to_string(),
                 });
                 if ctx.role == Role::Controller && !connect_sent {
-                    let peer = cfg
-                        .peer_id
-                        .clone()
-                        .context("controller requires a --peer id")?;
+                    let peer = cfg.peer_id.clone().expect("validated controller peer");
                     info!(%peer, "requesting connection to peer");
                     signaling.send(ClientMsg::Connect { peer_id: peer });
                     connect_sent = true;
@@ -174,21 +227,43 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                 initiator,
             } => {
                 info!(%session_id, %peer_id, initiator, "punch notify; starting session");
+                retry_at = None;
+                // Duplicate notifications must not orphan an older task or
+                // let its completion remove a newer session's routing entry.
+                if sessions.contains_key(&session_id) {
+                    continue;
+                }
                 let (tx, rx) = unbounded_channel();
-                sessions.insert(session_id.clone(), tx);
+                let (stop, stopped) = oneshot::channel();
+                sessions.insert(
+                    session_id.clone(),
+                    SessionControl {
+                        messages: tx,
+                        stop: Some(stop),
+                    },
+                );
                 let ctx = ctx.clone();
                 let sid = session_id.clone();
-                tokio::spawn(async move {
-                    let res =
-                        run_session(ctx.clone(), sid.clone(), peer_id, peer_noise_pubkey, rx).await;
+                tasks.spawn(async move {
+                    let res = until_stopped(
+                        run_session(ctx.clone(), sid.clone(), peer_id, peer_noise_pubkey, rx),
+                        stopped,
+                    )
+                    .await;
+                    // End every session, including setup failures and peer or
+                    // user cancellation, not only successful RDP bridges.
+                    ctx.signaling.send(ClientMsg::Bye {
+                        session_id: sid.clone(),
+                    });
                     let error = res.as_ref().err().map(|e| e.to_string());
                     if let Err(e) = &res {
                         warn!(session_id = %sid, error = %e, "session ended with error");
                     }
                     ctx.emit(ClientEvent::SessionEnded {
-                        session_id: sid,
+                        session_id: sid.clone(),
                         error,
                     });
+                    sid
                 });
             }
             ServerMsg::Error { code, message } => {
@@ -198,22 +273,25 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                 });
                 // The host may not be online yet — retry the connection request.
                 if ctx.role == Role::Controller && code == ErrorCode::PeerOffline {
-                    if let Some(peer) = cfg.peer_id.clone() {
-                        let signaling = signaling.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            info!(%peer, "retrying connection to peer");
-                            signaling.send(ClientMsg::Connect { peer_id: peer });
-                        });
-                    }
+                    retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(3));
                 }
             }
             ServerMsg::Pong => {}
+            ServerMsg::PeerOffline { session_id } => {
+                // The session may already be forwarding RDP and no longer
+                // reading setup messages. Cancel its entire future directly.
+                if let Some(stop) = sessions
+                    .get_mut(&session_id)
+                    .and_then(|session| session.stop.take())
+                {
+                    let _ = stop.send(());
+                }
+            }
             other => {
                 // Candidates / RelayAssign / PeerOffline — route to the session.
                 if let Some(sid) = route_session_id(&other).cloned() {
-                    if let Some(tx) = sessions.get(&sid) {
-                        let _ = tx.send(other);
+                    if let Some(session) = sessions.get(&sid) {
+                        let _ = session.messages.send(other);
                     } else {
                         debug!(session_id = %sid, "message for unknown session");
                     }
@@ -222,8 +300,27 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         }
     }
 
-    warn!("signaling connection closed");
+    for (_, session) in sessions.drain() {
+        if let Some(stop) = session.stop {
+            let _ = stop.send(());
+        }
+    }
+    // A completion means all scoped relay/UDP futures and their sockets have
+    // been dropped. JoinSet additionally aborts them if our owner is dropped.
+    while tasks.join_next().await.is_some() {}
+    connection.shutdown().await;
     Ok(())
+}
+
+async fn until_stopped(
+    work: impl Future<Output = Result<()>>,
+    stopped: oneshot::Receiver<()>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = stopped => Ok(()),
+        result = work => result,
+    }
 }
 
 fn route_session_id(msg: &ServerMsg) -> Option<&SessionId> {
@@ -288,10 +385,10 @@ async fn run_session(
         ctx.signaling.send(ClientMsg::RequestRelay {
             session_id: session_id.clone(),
         });
-        let relay_task = {
+        let relay_attempt = {
             let ctx = ctx.clone();
             let peer_pubkey = peer_pubkey.clone();
-            tokio::spawn(async move {
+            async move {
                 let (relay_addr, ticket) =
                     wait_for(&mut rx, Duration::from_secs(15), |m| match m {
                         ServerMsg::RelayAssign {
@@ -301,40 +398,51 @@ async fn run_session(
                     })
                     .await?;
                 relay::connect(relay_addr, &ticket, ctx.role, &ctx.device_key, &peer_pubkey).await
-            })
+            }
         };
+        tokio::pin!(relay_attempt);
 
         let socket = gathered
             .socket
             .into_std()
             .context("converting udp socket to std")?;
-        match quic::attempt(
+        let quic_attempt = quic::attempt(
             socket,
             &ctx.cert,
             &peer_offer.quic_cert_fp,
             &peer_addrs,
             ctx.role,
             Duration::from_secs(3),
-        )
-        .await
-        {
+        );
+        tokio::pin!(quic_attempt);
+        // Poll both attempts within this session. No detached pre-warm can
+        // outlive cancellation or a successful P2P choice.
+        let (quic_result, relay_result) = tokio::select! {
+            result = &mut quic_attempt => (result, None),
+            result = &mut relay_attempt => (quic_attempt.await, Some(result)),
+        };
+        match quic_result {
             Ok(t) => {
                 info!(%session_id, "P2P QUIC tunnel established (relay pre-warm cancelled)");
-                relay_task.abort();
                 Tunnel::Quic(t)
             }
             Err(e) => {
                 warn!(%session_id, error = %e, "P2P failed; using pre-warmed relay");
-                let rt = relay_task
-                    .await
-                    .context("relay pre-warm task")?
-                    .context("connecting relay tunnel")?;
+                let rt = match relay_result {
+                    Some(result) => result,
+                    None => relay_attempt.await,
+                }
+                .context("connecting relay tunnel")?;
                 info!(%session_id, "relay tunnel established");
                 Tunnel::Relay(rt)
             }
         }
     };
 
+    ctx.signaling.send(ClientMsg::PathSelected {
+        session_id: session_id.clone(),
+        path: tunnel.path(),
+    });
     ctx.emit(ClientEvent::TunnelUp {
         session_id: session_id.clone(),
         path: format!("{:?}", tunnel.path()).to_lowercase(),
@@ -342,22 +450,23 @@ async fn run_session(
 
     // 7. Bridge RDP for our role.
     match ctx.role {
-        Role::Host => ctx.emit(ClientEvent::HostBridging {
-            session_id: session_id.clone(),
-            rdp_addr: ctx.rdp_addr.to_string(),
-        }),
-        Role::Controller => ctx.emit(ClientEvent::RdpReady {
-            session_id: session_id.clone(),
-            listen_addr: ctx.listen_addr.to_string(),
-        }),
+        Role::Host => {
+            ctx.emit(ClientEvent::HostBridging {
+                session_id: session_id.clone(),
+                rdp_addr: ctx.rdp_addr.to_string(),
+            });
+            rdp::serve_host(tunnel, ctx.rdp_addr, ctx.enable_udp).await
+        }
+        Role::Controller => {
+            rdp::serve_controller_ready(tunnel, ctx.listen_addr, ctx.enable_udp, |addr| {
+                ctx.emit(ClientEvent::RdpReady {
+                    session_id: session_id.clone(),
+                    listen_addr: addr.to_string(),
+                })
+            })
+            .await
+        }
     }
-    let result = match ctx.role {
-        Role::Host => rdp::serve_host(tunnel, ctx.rdp_addr, ctx.enable_udp).await,
-        Role::Controller => rdp::serve_controller(tunnel, ctx.listen_addr, ctx.enable_udp).await,
-    };
-
-    ctx.signaling.send(ClientMsg::Bye { session_id });
-    result
 }
 
 /// Request a relay ticket from signaling and connect the encrypted relay tunnel.
@@ -404,5 +513,55 @@ async fn wait_for<T>(
         if let Some(v) = pick(msg) {
             return Ok(v);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn cancellation_releases_listener_before_completion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let (started, started_rx) = oneshot::channel();
+        let mut sessions = JoinSet::new();
+        sessions.spawn(until_stopped(
+            async move {
+                let _ = started.send(());
+                listener.accept().await?;
+                Ok(())
+            },
+            stopped,
+        ));
+        started_rx.await.unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sessions.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _replacement = TcpListener::bind(addr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn losing_owner_also_cancels_pending_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        drop(stop);
+        until_stopped(
+            async move {
+                listener.accept().await?;
+                Ok(())
+            },
+            stopped,
+        )
+        .await
+        .unwrap();
+        let _replacement = TcpListener::bind(addr).await.unwrap();
     }
 }

@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use spuria_common::transport::Role;
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::info;
 
 use crate::tunnel::{quic, Tunnel};
@@ -52,9 +52,23 @@ pub async fn serve_controller(
     listen_addr: SocketAddr,
     enable_udp: bool,
 ) -> Result<()> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("binding local RDP listener at {listen_addr}"))?;
+    serve_controller_ready(tunnel, listen_addr, enable_udp, |_| {}).await
+}
+
+/// Report readiness only after every required listener has bound. In
+/// particular, port 0 is resolved once and reused for both TCP and UDP.
+pub async fn serve_controller_ready(
+    tunnel: Tunnel,
+    listen_addr: SocketAddr,
+    enable_udp: bool,
+    ready: impl FnOnce(SocketAddr),
+) -> Result<()> {
+    let udp = if enable_udp {
+        tunnel.datagram_conn()
+    } else {
+        None
+    };
+    let (listener, udp_socket) = bind_controller(listen_addr, udp.is_some(), ready).await?;
     let local_addr = listener.local_addr()?;
     info!(
         path = ?tunnel.path(),
@@ -65,17 +79,79 @@ pub async fn serve_controller(
         .await
         .context("accepting local RDP client")?;
     info!(%peer, "local RDP client connected; bridging over tunnel");
-    let udp = if enable_udp {
-        tunnel.datagram_conn()
+    let reliable = tunnel.bridge(local, Role::Controller);
+    match (udp, udp_socket) {
+        (Some(conn), Some(socket)) => tokio::select! {
+            r = reliable => r,
+            r = quic::controller_udp_forward_socket(conn, socket) => r,
+        },
+        _ => reliable.await,
+    }
+}
+
+async fn bind_controller(
+    listen_addr: SocketAddr,
+    bind_udp: bool,
+    ready: impl FnOnce(SocketAddr),
+) -> Result<(TcpListener, Option<UdpSocket>)> {
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("binding local RDP listener at {listen_addr}"))?;
+    let local_addr = listener.local_addr()?;
+    let udp = if bind_udp {
+        Some(
+            UdpSocket::bind(local_addr)
+                .await
+                .with_context(|| format!("binding local UDP listener at {local_addr}"))?,
+        )
     } else {
         None
     };
-    let reliable = tunnel.bridge(local, Role::Controller);
-    match udp {
-        Some(conn) => tokio::select! {
-            r = reliable => r,
-            r = quic::controller_udp_forward(conn, listen_addr) => r,
-        },
-        None => reliable.await,
+    ready(local_addr);
+    Ok((listener, udp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn ready_reports_bound_tcp_and_udp_address() {
+        let reported = Cell::new(None);
+        let (listener, udp) = bind_controller("127.0.0.1:0".parse().unwrap(), true, |addr| {
+            assert_ne!(addr.port(), 0);
+            assert!(std::net::TcpListener::bind(addr).is_err());
+            assert!(std::net::UdpSocket::bind(addr).is_err());
+            reported.set(Some(addr));
+        })
+        .await
+        .unwrap();
+        assert_eq!(reported.get(), Some(listener.local_addr().unwrap()));
+        assert_eq!(
+            udp.unwrap().local_addr().unwrap(),
+            listener.local_addr().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_tcp_or_udp_bind_never_reports_ready() {
+        let ready = Cell::new(false);
+        let occupied_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            bind_controller(occupied_tcp.local_addr().unwrap(), false, |_| ready
+                .set(true))
+            .await
+            .is_err()
+        );
+        assert!(!ready.get());
+        let occupied_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied_udp.local_addr().unwrap();
+        assert!(bind_controller(addr, true, |_| ready.set(true))
+            .await
+            .is_err());
+        assert!(!ready.get());
+        // A partially completed bind must also release its TCP listener.
+        let _rebound = TcpListener::bind(addr).await.unwrap();
     }
 }

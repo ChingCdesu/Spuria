@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, env = "SPURIA_RELAY_ADDR", default_value_t = SocketAddr::from(([127,0,0,1], defaults::RELAY_PORT)))]
     relay_addr: SocketAddr,
 
+    /// Dedicated signing key shared only with relay, at least 32 random bytes.
+    #[arg(long, env = "SPURIA_RELAY_SECRET", hide_env_values = true)]
+    relay_secret: String,
+
     /// Shared team secret. If omitted, authentication is DISABLED (dev only).
     #[arg(long, env = "SPURIA_SECRET")]
     secret: Option<String>,
@@ -75,6 +79,7 @@ async fn main() -> Result<()> {
         ws_bind: cli.ws_bind,
         reflect_bind: cli.reflect_bind,
         relay_addr: cli.relay_addr,
+        relay_secret: cli.relay_secret,
         auth,
         admin_bind: cli.admin_bind,
         admin_token: cli.admin_token,

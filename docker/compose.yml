@@ -2,6 +2,7 @@
 #
 # Set these in a `.env` next to this file (or the environment):
 #   SPURIA_SECRET         team password clients authenticate with
+#   SPURIA_RELAY_SECRET   dedicated shared ticket-signing key (at least 32 bytes)
 #   SPURIA_ADMIN_TOKEN    bearer token for the admin dashboard
 #   SPURIA_RELAY_PUBLIC   address clients use to reach the relay (host:port)
 #
@@ -17,6 +18,8 @@ services:
         BINARY: spuria-signaling
     image: spuria-signaling
     restart: unless-stopped
+    environment:
+      SPURIA_RELAY_SECRET: ${SPURIA_RELAY_SECRET:?set SPURIA_RELAY_SECRET (at least 32 bytes)}
     command:
       - "--relay-addr=${SPURIA_RELAY_PUBLIC:-127.0.0.1:21118}"
       - "--secret=${SPURIA_SECRET:?set SPURIA_SECRET}"
@@ -35,5 +38,7 @@ services:
         BINARY: spuria-relay
     image: spuria-relay
     restart: unless-stopped
+    environment:
+      SPURIA_RELAY_SECRET: ${SPURIA_RELAY_SECRET:?set SPURIA_RELAY_SECRET (at least 32 bytes)}
     ports:
       - "21118:21118" # relay data plane

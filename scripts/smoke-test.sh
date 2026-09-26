@@ -12,6 +12,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=target/debug
 MODE="${1:-both}"
+# Local test fixture only; production servers must use a private random key.
+export SPURIA_RELAY_SECRET="spuria-smoke-only-ticket-secret-32-bytes"
 
 PIDS=()
 cleanup() {

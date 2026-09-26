@@ -4,7 +4,7 @@
 //! for protobuf, but since the whole stack is Rust we use serde/JSON for v1:
 //! debuggable, dependency-light, and trivially swappable behind these types.
 
-use crate::{candidate::SessionOffer, ids::DeviceId};
+use crate::{candidate::SessionOffer, ids::DeviceId, transport::TunnelPath};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -39,6 +39,11 @@ pub enum ClientMsg {
     },
     /// Ask the server to allocate a relay for this session.
     RequestRelay { session_id: SessionId },
+    /// Report the path after the authenticated tunnel has been established.
+    PathSelected {
+        session_id: SessionId,
+        path: TunnelPath,
+    },
     /// Tear down a session.
     Bye { session_id: SessionId },
 }
@@ -166,6 +171,10 @@ mod tests {
             },
             ClientMsg::Bye {
                 session_id: "s".into(),
+            },
+            ClientMsg::PathSelected {
+                session_id: "s".into(),
+                path: TunnelPath::P2p,
             },
         ] {
             let back = ClientMsg::from_text(&m.to_text().unwrap()).unwrap();

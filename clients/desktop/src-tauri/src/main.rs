@@ -6,20 +6,33 @@
 //! The GUI drives the same [`spuria_client::app::run`] state machine as the CLI.
 //! A `connect` command spawns the session on Tauri's async runtime and forwards
 //! [`spuria_client::ClientEvent`]s to the frontend as `client-event` events; a
-//! `disconnect` command aborts it. The system RDP bridge / IronRDP integration
+//! `disconnect` command stops and awaits it. The system RDP bridge / IronRDP integration
 //! is unchanged from the library — the GUI is purely a front-end over it.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Mutex};
+use std::{net::SocketAddr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use spuria_client::{app, AppConfig};
 use spuria_common::{ids::DeviceId, transport::Role};
 use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager, State};
+use tokio::sync::{oneshot, Mutex};
 
 /// Holds the currently-running session task (if any).
 #[derive(Default)]
 struct AppState {
-    task: Mutex<Option<JoinHandle<()>>>,
+    task: Mutex<Option<RunningClient>>,
+}
+
+struct RunningClient {
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl RunningClient {
+    async fn shutdown(self) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
+    }
 }
 
 /// Global, persisted client configuration — edited on the Settings page and
@@ -192,16 +205,9 @@ async fn connect(
         return Err("controller mode requires a peer device id".into());
     }
 
-    // Forward client events to the frontend.
+    // Event forwarding is owned by the same task as the client, so an old
+    // connection cannot emit stale events after its replacement starts.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    {
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                let _ = app.emit("client-event", ev);
-            }
-        });
-    }
 
     let cfg = AppConfig {
         role,
@@ -218,30 +224,45 @@ async fn connect(
         events: Some(tx),
     };
 
-    // Replace any existing session.
-    abort_task(&state);
+    // Serialize replacement and disconnect through the whole shutdown. The
+    // command returns only after previous RDP listeners/bridges have stopped.
+    let mut running = state.task.lock().await;
+    if let Some(previous) = running.take() {
+        previous.shutdown().await;
+    }
+    let (stop, stopped) = oneshot::channel();
     let app_for_run = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        if let Err(e) = app::run(cfg).await {
+        let run = app::run_until_shutdown(cfg, async {
+            let _ = stopped.await;
+        });
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                Some(ev) = rx.recv() => { let _ = app_for_run.emit("client-event", ev); }
+            }
+        };
+        while let Ok(ev) = rx.try_recv() {
+            let _ = app_for_run.emit("client-event", ev);
+        }
+        if let Err(e) = result {
             let _ = app_for_run.emit("client-error", e.to_string());
         }
         let _ = app_for_run.emit("client-stopped", ());
     });
-    *state.task.lock().unwrap() = Some(handle);
+    *running = Some(RunningClient { stop, task: handle });
 
     Ok(device_id)
 }
 
 #[tauri::command]
-fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    abort_task(&state);
-    Ok(())
-}
-
-fn abort_task(state: &State<'_, AppState>) {
-    if let Some(handle) = state.task.lock().unwrap().take() {
-        handle.abort();
+async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    let mut running = state.task.lock().await;
+    if let Some(client) = running.take() {
+        client.shutdown().await;
     }
+    Ok(())
 }
 
 /// Check the configured update endpoint and install if a newer version exists.

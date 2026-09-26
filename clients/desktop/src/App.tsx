@@ -53,14 +53,20 @@ export default function App() {
         <Box p="5" style={{ flexGrow: 1, overflow: "auto" }}>
           {!settings ? (
             <Text color="gray">Loading…</Text>
-          ) : tab === "home" ? (
-            <Home
-              settings={settings}
-              deviceId={info?.device_id ?? "…"}
-              onOpenSettings={() => setTab("settings")}
-            />
           ) : (
-            <SettingsView settings={settings} info={info} onSaved={setSettings} />
+            <>
+              {/* Keep the runtime event subscriptions and session state alive while editing settings. */}
+              <div hidden={tab !== "home"}>
+                <Home
+                  settings={settings}
+                  deviceId={info?.device_id ?? "…"}
+                  onOpenSettings={() => setTab("settings")}
+                />
+              </div>
+              {tab === "settings" && (
+                <SettingsView settings={settings} info={info} onSaved={setSettings} />
+              )}
+            </>
           )}
         </Box>
       </Flex>

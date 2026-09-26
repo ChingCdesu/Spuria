@@ -46,7 +46,7 @@ hex = "0.4"
 rand = "0.8"
 
 # signaling transport
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # admin HTTP API
 axum = "0.7"

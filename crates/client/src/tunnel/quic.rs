@@ -25,7 +25,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{copy, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::certs::SelfSignedCert;
@@ -179,7 +178,11 @@ pub async fn controller_udp_forward(conn: Connection, listen: SocketAddr) -> Res
     let sock = UdpSocket::bind(listen)
         .await
         .with_context(|| format!("binding local UDP listener {listen}"))?;
-    info!(%listen, "UDP multitransport listener ready");
+    controller_udp_forward_socket(conn, sock).await
+}
+
+pub(crate) async fn controller_udp_forward_socket(conn: Connection, sock: UdpSocket) -> Result<()> {
+    info!(listen = %sock.local_addr()?, "UDP multitransport listener ready");
     let mut next_id: u32 = 1;
     let mut by_addr: HashMap<SocketAddr, u32> = HashMap::new();
     let mut by_id: HashMap<u32, SocketAddr> = HashMap::new();
@@ -212,9 +215,27 @@ pub async fn controller_udp_forward(conn: Connection, listen: SocketAddr) -> Res
 /// one socket per flow.
 pub async fn host_udp_forward(conn: Connection, rdp_addr: SocketAddr) -> Result<()> {
     let mut flows: HashMap<u32, Arc<UdpSocket>> = HashMap::new();
-    let mut readers: Vec<JoinHandle<()>> = Vec::new();
-    // Runs until the connection closes (read_datagram errors).
-    while let Ok(dg) = conn.read_datagram().await {
+    // Scoped futures own the sockets: dropping this forwarder cancels every
+    // read immediately, including when the reliable bridge finishes first.
+    let mut readers = FuturesUnordered::new();
+    loop {
+        let dg = tokio::select! {
+            dg = conn.read_datagram() => match dg {
+                Ok(dg) => dg,
+                Err(_) => break,
+            },
+            Some((id, sock, reply)) = readers.next(), if !readers.is_empty() => {
+                let reply: std::io::Result<Vec<u8>> = reply;
+                match reply {
+                    Ok(payload) => {
+                        pack_datagram(&conn, id, &payload);
+                        readers.push(read_udp_reply(id, sock));
+                    }
+                    Err(_) => { flows.remove(&id); }
+                }
+                continue;
+            }
+        };
         let Some((id, payload)) = unpack_datagram(&dg) else {
             continue;
         };
@@ -229,24 +250,25 @@ pub async fn host_udp_forward(conn: Connection, rdp_addr: SocketAddr) -> Result<
                     }
                 };
                 flows.insert(id, s.clone());
-                // Reader: replies from the RDP service back through the tunnel.
-                let conn = conn.clone();
-                let reader_sock = s.clone();
-                readers.push(tokio::spawn(async move {
-                    let mut buf = vec![0u8; 65535];
-                    while let Ok(n) = reader_sock.recv(&mut buf).await {
-                        pack_datagram(&conn, id, &buf[..n]);
-                    }
-                }));
+                readers.push(read_udp_reply(id, s.clone()));
                 s
             }
         };
         let _ = sock.send(payload).await;
     }
-    for r in readers {
-        r.abort();
-    }
     Ok(())
+}
+
+async fn read_udp_reply(
+    id: u32,
+    sock: Arc<UdpSocket>,
+) -> (u32, Arc<UdpSocket>, std::io::Result<Vec<u8>>) {
+    let mut buf = vec![0u8; 65535];
+    let result = sock.recv(&mut buf).await.map(|n| {
+        buf.truncate(n);
+        buf
+    });
+    (id, sock, result)
 }
 
 async fn bind_local_udp(rdp_addr: SocketAddr) -> Result<UdpSocket> {
@@ -302,12 +324,14 @@ fn client_config(cert: &SelfSignedCert, peer_fp: &str) -> Result<ClientConfig> {
 #[derive(Debug)]
 struct PinnedCertVerifier {
     fingerprint: String,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl PinnedCertVerifier {
     fn new(fingerprint: &str) -> Self {
         Self {
             fingerprint: fingerprint.to_string(),
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
     }
 
@@ -320,16 +344,6 @@ impl PinnedCertVerifier {
             ))
         }
     }
-}
-
-fn pinned_schemes() -> Vec<SignatureScheme> {
-    vec![
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        SignatureScheme::ECDSA_NISTP384_SHA384,
-        SignatureScheme::ED25519,
-        SignatureScheme::RSA_PSS_SHA256,
-        SignatureScheme::RSA_PKCS1_SHA256,
-    ]
 }
 
 impl ServerCertVerifier for PinnedCertVerifier {
@@ -347,25 +361,24 @@ impl ServerCertVerifier for PinnedCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        // We pin the certificate itself, so we accept its signatures.
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        pinned_schemes()
+        self.algorithms.supported_schemes()
     }
 }
 
@@ -386,23 +399,102 @@ impl ClientCertVerifier for PinnedCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        pinned_schemes()
+        self.algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::internal::msgs::codec::Codec;
+
+    fn signed(cert: &SelfSignedCert, message: &[u8]) -> DigitallySignedStruct {
+        let key = rustls::crypto::ring::sign::any_supported_type(&cert.rustls_key()).unwrap();
+        let signer = key
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .unwrap();
+        let signature = signer.sign(message).unwrap();
+        // rustls exposes no public constructor; decode the normal TLS wire
+        // representation to exercise exactly the verifier's input type.
+        let mut encoded = Vec::new();
+        signer.scheme().encode(&mut encoded);
+        (signature.len() as u16).encode(&mut encoded);
+        encoded.extend(signature);
+        DigitallySignedStruct::read_bytes(&encoded).unwrap()
+    }
+
+    #[test]
+    fn pinning_requires_private_key_proof_in_both_directions() {
+        let peer = crate::certs::generate().unwrap();
+        let attacker = crate::certs::generate().unwrap();
+        let verifier = PinnedCertVerifier::new(&peer.fingerprint);
+        let cert = peer.rustls_cert();
+        let message = b"TLS CertificateVerify transcript";
+        let valid = signed(&peer, message);
+        let forged = signed(&attacker, message);
+        assert!(verifier.check(&cert).is_ok());
+        assert!(verifier.check(&attacker.rustls_cert()).is_err());
+
+        for signature in [&valid, &forged] {
+            let expected = std::ptr::eq(signature, &valid);
+            assert_eq!(
+                ServerCertVerifier::verify_tls13_signature(&verifier, message, &cert, signature)
+                    .is_ok(),
+                expected
+            );
+            assert_eq!(
+                ClientCertVerifier::verify_tls13_signature(&verifier, message, &cert, signature)
+                    .is_ok(),
+                expected
+            );
+            assert_eq!(
+                ServerCertVerifier::verify_tls12_signature(&verifier, message, &cert, signature)
+                    .is_ok(),
+                expected
+            );
+            assert_eq!(
+                ClientCertVerifier::verify_tls12_signature(&verifier, message, &cert, signature)
+                    .is_ok(),
+                expected
+            );
+        }
+        assert!(
+            ServerCertVerifier::verify_tls13_signature(&verifier, b"tampered", &cert, &valid)
+                .is_err()
+        );
+        assert!(
+            ClientCertVerifier::verify_tls13_signature(&verifier, b"tampered", &cert, &valid)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_udp_readers_releases_every_socket() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let weak = Arc::downgrade(&sock);
+        let mut readers = FuturesUnordered::new();
+        readers.push(read_udp_reply(1, sock));
+        assert!(futures_util::poll!(readers.next()).is_pending());
+        drop(readers);
+        assert!(weak.upgrade().is_none());
+        let _rebound = UdpSocket::bind(addr).await.unwrap();
     }
 }

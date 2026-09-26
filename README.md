@@ -2,7 +2,7 @@
 
 > P2P 隧道远程桌面 · 基于 RDP · P2P 直连优先,服务端中继降级 · 全栈 Rust
 >
-> 本仓库按 [`p2p-rdp-tunnel-plan.md`](p2p-rdp-tunnel-plan.md) 实现。**P0–P4 全部里程碑均已落地并通过测试**:纯中继直通、QUIC P2P 直连、智能降级(happy-eyeballs)、RDP UDP 多传输(经隧道数据报通道,L4 转发)、安全/加固(双向证书钉定、限流、指标、可插拔鉴权)。唯一保留为可选精化项的是「主控内嵌 IronRDP(无回环端口)」——其功能目标已由通用 L4 转发达成(详见下文)。
+> 本仓库按 [`p2p-rdp-tunnel-plan.md`](p2p-rdp-tunnel-plan.md) 实现了中继、QUIC P2P、建链降级、L4 UDP 转发及桌面/管理界面。**实现范围与运行验收分开记录**：单元测试和编译不代表真实 Windows RDP、跨 NAT 穿透或 RDP UDP 多传输已验收。进程内 E2E 使用 TCP/UDP 回声服务，也不能替代这些环境中的验证。
 
 ---
 
@@ -60,8 +60,14 @@
 ```sh
 cargo build --workspace            # 调试构建
 cargo build --workspace --release  # 发布构建
-cargo test  --workspace            # 单元测试(含 Noise KK 往返)
+cargo test  --workspace            # 单元测试 + 进程内 E2E
 ```
+
+仅运行单元测试、不运行 E2E：`cargo test --workspace --lib --bins`。
+完整本机编译先在管理网页目录运行 `npm run build` 生成嵌入页面，再执行根目录的
+`cargo build --workspace --all-targets --release`，最后在桌面目录执行
+`npm run tauri -- build --no-bundle`。
+`--all-targets` 会编译 E2E 测试目标，但不会执行它。
 
 ---
 
@@ -81,6 +87,14 @@ spuria --secret team-secret --device-id 111111111 host
 spuria --secret team-secret --device-id 222222222 control 111111111
 #   → 日志打印 "RDP tunnel READY",用 mstsc 连接 127.0.0.1:33389 即可
 ```
+
+启动前为**信令和中继**设置相同的 `SPURIA_RELAY_SECRET` 环境变量（至少 32 字节，
+使用随机私密值；也可通过 `--relay-secret` 传入）。这是服务端之间签发/验证限时中继票据的
+专用密钥，不能使用公开示例值，也不应分发给客户端。客户端仍仅使用团队口令或设备 token。
+缺少密钥时服务端拒绝启动；两端需一起升级，旧版未签名票据不再受理。
+票据有效期为 120 秒。中继默认握手超时 5 秒、配对等待 30 秒、无字节进展超时 300 秒；
+可通过 `--hello-timeout-secs`、`--park-timeout-secs` 和 `--idle-timeout-secs` 调整。
+默认最多 1024 条 TCP 连接（含握手和等待配对）及 256 个已配对会话。
 
 常用参数:
 
@@ -118,8 +132,8 @@ bash scripts/smoke-test.sh relay  # 只测中继
 ```sh
 cd clients/desktop
 npm install
-npm run dev      # 开发运行
-npm run build    # 产出 MSI 安装包(+ 自动更新工件)
+npm run tauri dev    # 开发运行桌面客户端
+npm run tauri build  # 产出 MSI 安装包(+ 自动更新工件，需配置签名)
 ```
 
 GUI 复用 `spuria_client` 库(同一套状态机),通过事件实时显示连接状态/日志;主控会提示「把 RDP 客户端指向 127.0.0.1:33389」。MSI、自动更新与签名密钥配置见 [clients/desktop/README](clients/desktop/README.md)。
@@ -162,7 +176,7 @@ npm install && npm run build   # 重新生成 crates/signaling/src/admin_dashboa
 docker build -f docker/Dockerfile --build-arg BINARY=spuria-signaling -t spuria-signaling .
 docker build -f docker/Dockerfile --build-arg BINARY=spuria-relay     -t spuria-relay .
 
-# 或用 compose 一起拉起(在 docker/.env 设置 SPURIA_SECRET / SPURIA_ADMIN_TOKEN / SPURIA_RELAY_PUBLIC)
+# 或用 compose 一起拉起(设置 SPURIA_SECRET / SPURIA_ADMIN_TOKEN / SPURIA_RELAY_PUBLIC / SPURIA_RELAY_SECRET)
 docker compose -f docker/compose.yml up --build
 ```
 
@@ -174,7 +188,7 @@ docker compose -f docker/compose.yml up --build
 
 | 工作流 | 触发 | 内容 |
 |---|---|---|
-| `ci.yml` | push/PR | `fmt --check`、`clippy -D warnings`、`cargo test --workspace`(ubuntu + windows) |
+| `ci.yml` | push/PR/手动 | `fmt --check`、`clippy -D warnings`、完整编译、单元测试(ubuntu + windows)；E2E 仅手动勾选时执行 |
 | `docker.yml` | push/PR/tag | 构建 `spuria-signaling`/`spuria-relay` 镜像,推送 GHCR(PR 仅构建) |
 | `release-client.yml` | tag `v*` | Windows 构建 MSI + 自动更新工件,附到草稿 Release(`tauri-action`) |
 
@@ -183,12 +197,13 @@ docker compose -f docker/compose.yml up --build
 ## 安全模型(对应 plan §6)
 
 - **中继路径**:`Noise_KK_25519_ChaChaPoly_BLAKE2s`。双方静态公钥经信令交换并互相钉定;中继只转发密文。
-- **P2P 路径**:QUIC-TLS,自签证书 + **双向指纹钉定**(连接方校验接受方证书、接受方校验连接方客户端证书,均 == 信令交换的指纹),任一不符即中断握手,防中间人。
+- **P2P 路径**:QUIC-TLS,自签证书 + **双向指纹钉定与握手签名验证**。指纹必须与信令交换值一致，同时验证握手方持有相应私钥。
+- **中继授权**:信令用专用 `SPURIA_RELAY_SECRET` 签发限时票据，中继验证签名和有效期、限制重放，并限制握手时间、总连接数、配对等待和转发空闲时间。
 - **鉴权**:`Authenticator` trait,可插拔。内置 `SharedSecretAuth`(团队口令)与 `TokenFileAuth`(`--auth-file`,每设备 `device_id:token`),后者演示 SSO 接入点。
 - **限流**:信令与中继均对每源 IP 做令牌桶限流(`--max-conn-per-sec`,突发 3×),抵御连接洪泛。
 - **纵深防御**:隧道层加密之上,RDP 层 NLA(CredSSP)端到端叠加。
 
-> 生产部署:信令应置于 WSS/TLS 之后;管理 API 用 `--admin-token` 鉴权并仅在内网暴露。
+> 生产部署:信令应置于 WSS/TLS 之后，客户端支持 `wss://` 并使用系统根证书验证服务端；管理 API 用 `--admin-token` 鉴权并仅在内网暴露。中继票据授权依赖信令通道保密，必须保护服务端专用密钥。
 > 全双工 P2P↔中继**会话内无感迁移**(已建立的活动会话从中继切到 P2P 而不断流)需要一层路径提交握手,
 > 列为后续项;当前在**建链时**做 happy-eyeballs 选路,选定后稳定运行。
 
@@ -198,15 +213,15 @@ docker compose -f docker/compose.yml up --build
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
-| **P0** 纯中继直通 + E2E 加密 | ✅ 完成 | 信令注册/在线、中继 TCP 盲转发、Noise KK;单测 + 进程内 e2e + 冒烟测试 |
-| **P1** QUIC P2P 直连 | ✅ 完成 | srflx 反射、UDP 打洞、QUIC 可靠流、候选并行竞速;e2e/冒烟通过 |
-| **P2** 智能降级 | ✅ 完成 | happy-eyeballs:并行预热中继 + 优先 P2P + 即时回退;候选 happy-eyeballs 竞速 |
-| **P3** RDP UDP 多传输 | ✅ 完成(L4) | QUIC 数据报通道 + 按流多路复用的 UDP 双转发(主控本地 UDP 监听、被控转发 3389/UDP);中继路径按计划回退纯 TCP;e2e 含 UDP 回环验证 |
-| **P4** 加固与体验 | ✅ 完成 | 双向证书钉定、每 IP 限流、Prometheus `/metrics`、可插拔鉴权(口令 + 令牌文件)、管理网页、Tauri GUI |
+| **P0** 纯中继直通 + E2E 加密 | 已实现 | 信令注册/在线、签名票据、中继 TCP 盲转发、Noise KK；有单测及独立 E2E/冒烟入口 |
+| **P1** QUIC P2P 直连 | 已实现 | srflx 反射、UDP 打洞、QUIC 可靠流、候选并行竞速；跨 NAT 运行验收需另行执行 |
+| **P2** 智能降级 | 已实现 | happy-eyeballs：并行预热中继 + 优先 P2P + 回退；网络故障场景需另行验证 |
+| **P3** RDP UDP 多传输 | L4 转发已实现 | QUIC 数据报与 UDP 流转发；回声测试不证明真实 RDP UDP 协商成功 |
+| **P4** 加固与体验 | 已实现，持续验证 | 双向证书/签名校验、限流、指标、鉴权、管理网页、Tauri GUI；自动更新仍需真实公钥和发布地址 |
 
 ### 唯一保留的可选精化项
 
-计划 §3.4 给出 P3 的两种实现之一是「主控**内嵌 IronRDP**、无回环端口、把其 RDPEUDP/RDPEMT 的 UDP I/O 直接注入隧道数据报通道」。本仓库改用**通用 L4 转发**(主控本地 TCP+UDP 监听 → 隧道 → 被控 127.0.0.1:3389),**等价地达成了 P3 的功能目标**(RDP UDP 多传输经 P2P 隧道生效),且对任意 RDP 客户端通用、可立即验证。
+计划 §3.4 给出 P3 的两种实现之一是「主控**内嵌 IronRDP**、无回环端口、把其 RDPEUDP/RDPEMT 的 UDP I/O 直接注入隧道数据报通道」。本仓库改用**通用 L4 转发**(主控本地 TCP+UDP 监听 → 隧道 → 被控 127.0.0.1:3389)。它提供数据通道，但真实 RDP 客户端是否成功协商并使用 UDP，仍需在 Windows 环境单独验收。
 
 内嵌 IronRDP 仅在需要「主控端无本地回环端口」这一特定形态时才必要(plan 决策 #6),属可选精化:它需要 IronRDP 驱动完整 RDP 协议(图形/输入/NLA)并依赖其 UDP 数据面成熟度,需真实 RDP 服务端 + 显示环境联调。相关接入点在 [`crates/client/src/rdp.rs`](crates/client/src/rdp.rs) 注释标出。
 

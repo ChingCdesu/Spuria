@@ -48,8 +48,9 @@ npm run tauri build  # runs `npm run build` (tsc + vite) then bundles
 
 > `createUpdaterArtifacts` is on, so a release build also signs the updater
 > bundle and needs the `TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]` env vars (below).
-> For a quick **unsigned** local MSI, build just that target:
-> `npm run tauri build -- --bundles msi`. CI signs the full set on tagged releases.
+> To compile the complete desktop executable without installers or signing:
+> `npm run tauri -- build --no-bundle`. Merely selecting `--bundles msi` does
+> not disable `createUpdaterArtifacts` or its signing requirement.
 
 ## Auto-update
 

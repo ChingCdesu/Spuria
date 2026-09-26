@@ -20,13 +20,18 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-use crate::{admin, reflect, registry::Registry};
+use crate::{
+    admin, reflect,
+    registry::{ConnectionId, Registry},
+};
 
 pub struct SignalingConfig {
     pub ws_bind: SocketAddr,
     pub reflect_bind: SocketAddr,
     /// Public address clients should dial to reach the relay.
     pub relay_addr: SocketAddr,
+    /// Dedicated ticket signing key shared only with the relay server (32+ bytes).
+    pub relay_secret: String,
     pub auth: Arc<dyn Authenticator>,
     /// If set (with `admin_token`), start the admin HTTP API on this address.
     pub admin_bind: Option<SocketAddr>,
@@ -36,7 +41,7 @@ pub struct SignalingConfig {
 }
 
 pub async fn run(cfg: SignalingConfig) -> Result<()> {
-    let registry = Arc::new(Registry::new(cfg.relay_addr));
+    let registry = Arc::new(Registry::new(cfg.relay_addr, &cfg.relay_secret)?);
 
     // Reflection (srflx) service runs alongside the WS control plane.
     {
@@ -137,7 +142,7 @@ async fn handle_conn(
     });
 
     // The first frame must be a valid, authenticated Register.
-    let device_id = match read.next().await {
+    let (device_id, connection_id) = match read.next().await {
         Some(Ok(Message::Text(t))) => {
             match register(&registry, &*auth, t.as_str(), peer, &tx, kick_tx) {
                 Ok(id) => id,
@@ -174,7 +179,9 @@ async fn handle_conn(
                     }
                 };
                 match ClientMsg::from_text(text.as_str()) {
-                    Ok(msg) => dispatch(&registry, &device_id, &tx, msg),
+                    Ok(msg) => registry.with_connection(&device_id, connection_id, || {
+                        dispatch(&registry, &device_id, &tx, msg);
+                    }),
                     Err(e) => debug!(%peer, error = %e, "ignoring malformed client message"),
                 }
             }
@@ -185,7 +192,7 @@ async fn handle_conn(
         }
     }
 
-    registry.unregister(&device_id);
+    registry.unregister(&device_id, connection_id);
     drop(tx);
     let _ = writer.await;
     Ok(())
@@ -199,7 +206,7 @@ fn register(
     peer: SocketAddr,
     tx: &UnboundedSender<ServerMsg>,
     kick: oneshot::Sender<()>,
-) -> Result<DeviceId> {
+) -> Result<(DeviceId, ConnectionId)> {
     let msg = ClientMsg::from_text(text).context("parsing register frame")?;
     let ClientMsg::Register {
         device_id,
@@ -216,15 +223,12 @@ fn register(
     })
     .map_err(|e| anyhow!("{e}"))?;
 
-    registry.register(device_id.clone(), noise_pubkey, tx.clone(), kick);
-    registry.send(
-        &device_id,
-        ServerMsg::Registered {
-            device_id: device_id.clone(),
-            observed: Some(peer),
-        },
-    );
-    Ok(device_id)
+    let connection_id = registry.register(device_id.clone(), noise_pubkey, tx.clone(), kick);
+    let _ = tx.send(ServerMsg::Registered {
+        device_id: device_id.clone(),
+        observed: Some(peer),
+    });
+    Ok((device_id, connection_id))
 }
 
 /// Route a control message from an already-registered device.
@@ -242,6 +246,7 @@ fn dispatch(registry: &Registry, me: &DeviceId, tx: &UnboundedSender<ServerMsg>,
             registry.forward_candidates(me, &session_id, offer)
         }
         ClientMsg::RequestRelay { session_id } => registry.assign_relay(me, &session_id),
+        ClientMsg::PathSelected { session_id, path } => registry.record_path(me, &session_id, path),
         ClientMsg::Bye { session_id } => registry.close_session(me, &session_id),
     }
 }

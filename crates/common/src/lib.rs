@@ -14,6 +14,7 @@ pub mod error;
 pub mod ids;
 pub mod protocol;
 pub mod ratelimit;
+pub mod relay_ticket;
 pub mod transport;
 
 pub use error::{Error, Result};

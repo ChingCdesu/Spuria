@@ -15,7 +15,7 @@ export interface Session {
   session_id: string;
   controller: string;
   host: string;
-  relayed: boolean;
+  path: "p2p" | "relay" | null;
   age_secs: number;
 }
 export interface Audit {
