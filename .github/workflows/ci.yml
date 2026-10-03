@@ -89,3 +89,5 @@ jobs:
       - name: compile desktop Rust and frontend without signing or packaging
         working-directory: clients/desktop
         run: npm run tauri -- build --no-bundle --ci
+      - name: desktop unit tests (no native RDP process or E2E)
+        run: cargo test --manifest-path clients/desktop/src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol --locked

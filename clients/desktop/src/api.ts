@@ -22,6 +22,7 @@ export interface Settings {
 export interface AppInfo {
   version: string;
   device_id: string;
+  rdp_launch_supported: boolean;
 }
 
 export type Role = "controller" | "host";
@@ -33,6 +34,20 @@ export interface ConnectOpts {
   listen?: string | null;
   rdp?: string | null;
   force_relay: boolean;
+  rdp_launch?: { username: string; password: string } | null;
+  allow_forward_ports?: number[];
+}
+
+export interface ForwardInfo {
+  forward_id: string;
+  listen_addr: string;
+  remote_port: number;
+}
+
+export interface RdpLaunchEvent {
+  session_id: string;
+  status: "launched" | "failed";
+  message?: string;
 }
 
 export type ClientEvent =
@@ -41,6 +56,10 @@ export type ClientEvent =
   | { kind: "tunnel_up"; session_id: string; path: string }
   | { kind: "rdp_ready"; session_id: string; listen_addr: string }
   | { kind: "host_bridging"; session_id: string; rdp_addr: string }
+  | { kind: "port_forwarding_available"; session_id: string; available: boolean }
+  | ({ kind: "port_forward_started"; session_id: string } & ForwardInfo)
+  | { kind: "port_forward_stopped"; session_id: string; forward_id: string }
+  | { kind: "port_forward_error"; session_id: string; forward_id: string; message: string }
   | { kind: "session_ended"; session_id: string; error?: string | null }
   | { kind: "error"; message: string };
 
@@ -51,6 +70,10 @@ export const api = {
   ensureDeviceId: () => invoke<string>("ensure_device_id"),
   connect: (opts: ConnectOpts) => invoke<string>("connect", { opts }),
   disconnect: () => invoke<void>("disconnect"),
+  startPortForward: (sessionId: string, listenAddr: string, remotePort: number) =>
+    invoke<ForwardInfo>("start_port_forward", { sessionId, listenAddr, remotePort }),
+  stopPortForward: (sessionId: string, forwardId: string) =>
+    invoke<void>("stop_port_forward", { sessionId, forwardId }),
   checkUpdate: () => invoke<string>("check_update"),
 };
 
@@ -62,4 +85,7 @@ export function onClientStopped(cb: () => void): Promise<UnlistenFn> {
 }
 export function onClientError(cb: (msg: string) => void): Promise<UnlistenFn> {
   return listen<string>("client-error", (e) => cb(e.payload));
+}
+export function onRdpLaunch(cb: (event: RdpLaunchEvent) => void): Promise<UnlistenFn> {
+  return listen<RdpLaunchEvent>("rdp-launch", (event) => cb(event.payload));
 }

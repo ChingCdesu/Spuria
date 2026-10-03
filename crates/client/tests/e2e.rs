@@ -132,6 +132,9 @@ async fn run_path(force_relay: bool) {
         force_relay,
         enable_udp: true,
         events: Some(host_tx),
+        allow_forward_ports: vec![],
+        initial_forwards: vec![],
+        controls: None,
     }));
     assert!(
         wait_ev(&mut host_rx, |e| matches!(
@@ -160,6 +163,9 @@ async fn run_path(force_relay: bool) {
         force_relay,
         enable_udp: true,
         events: Some(ctrl_tx),
+        allow_forward_ports: vec![],
+        initial_forwards: vec![],
+        controls: None,
     }));
 
     // Assert the expected path was taken.

@@ -2,7 +2,7 @@
 
 Spuria 是为远程桌面提供连接通道的项目：优先使用 QUIC P2P 直连，无法建立直连时回退到端到端加密的 TCP 中继。核心服务与客户端库使用 Rust，桌面客户端使用 Tauri 2、React 和 TypeScript，管理网页使用 React。
 
-当前版本为 `0.1.0`。Spuria 转发现有 RDP 客户端与被控设备 RDP 服务之间的流量，不包含桌面画面渲染或内嵌 RDP 客户端。被控设备需要自行启用 RDP 服务；主控端通过 `mstsc` 等 RDP 客户端连接本地监听端口。
+当前版本为 `0.1.0`。Spuria 转发现有 RDP 客户端与被控设备 RDP 服务之间的流量，也支持独立使用 TCP 端口映射，不包含桌面画面渲染或内嵌 RDP 客户端。使用远程桌面时，被控设备需要自行启用 RDP 服务；Windows 桌面主控端可在隧道就绪后自动打开系统 `mstsc`，也可用外部 RDP 客户端手动连接本地监听端口。仅使用端口映射时不需要 RDP 服务。
 
 ## 当前能力与边界
 
@@ -11,7 +11,8 @@ Spuria 是为远程桌面提供连接通道的项目：优先使用 QUIC P2P 直
 | P2P 直连 | UDP 候选收集、地址反射、打洞、QUIC 可靠流；双向校验证书指纹和 TLS 握手签名 |
 | 中继回退 | 建链时并行预热中继，优先选择 P2P；中继使用 TCP + `Noise_KK_25519_ChaChaPoly_BLAKE2s`，只转发密文 |
 | UDP 转发 | 默认启用，在 QUIC 路径上提供 L4 UDP 转发；中继路径仅支持 TCP |
-| 桌面客户端 | 主控与被控两种角色、连接状态、日志、设置持久化；单个应用实例一次运行一种角色 |
+| TCP 端口映射 | 协商成功的会话支持多个本地回环端口映射，经 P2P 或加密中继访问被控端明确允许的回环 TCP 端口 |
+| 桌面客户端 | 主控与被控两种角色、连接状态、日志、设置持久化；Windows 可使用本次输入的凭据自动打开系统 RDP 客户端；单个应用实例一次运行一种角色 |
 | 命令行客户端 | `host` / `control` 子命令，供无人值守运行或自动化调用；不包含系统服务安装功能 |
 | 管理网页 | 在线设备、登记会话、双方确认的连接路径、踢出设备、内存审计日志和 Prometheus 指标 |
 | 鉴权 | 团队口令或每设备 token 文件；SSO 仅有可扩展接口，尚未接入身份提供方 |
@@ -29,7 +30,7 @@ Spuria 是为远程桌面提供连接通道的项目：优先使用 QUIC P2P 直
 127.0.0.1:3389（被控设备已有的 RDP 服务）
 ```
 
-每个隧道会话桥接一条主控侧 TCP 连接。当前没有会话内 P2P/中继无感切换，也没有信令断线或会话结束后的自动重连；主控发起连接时，如果对端尚未在线，会间隔重试。桌面端断开会等待会话和相关任务退出，再释放连接资源。
+双方客户端与信令均支持新协议时，隧道可承载 RDP 和多个 TCP 端口映射；关闭 RDP 连接不会结束整个隧道。与旧客户端或旧信令连接时仍使用单条 RDP TCP 连接的兼容流程，不提供端口映射。当前没有会话内 P2P/中继无感切换，也没有信令断线或会话结束后的自动重连；主控发起连接时，如果对端尚未在线，会间隔重试。桌面端断开会等待会话和相关任务退出，再释放连接资源。
 
 真实 Windows RDP、跨 NAT 直连成功率和 RDPEUDP/RDPEMT 协商尚未完成验收。L4 UDP 转发的实现与回声测试不能证明 RDP UDP 多传输可用。内嵌 IronRDP 仍是未实现的可选方向；[原始设计计划](p2p-rdp-tunnel-plan.md) 用于说明设计背景，不是已完成功能清单。
 
@@ -40,7 +41,7 @@ Spuria 是为远程桌面提供连接通道的项目：优先使用 QUIC P2P 直
 | `crates/common` | `spuria_common`：协议、设备身份、加密、鉴权、签名中继票据和限流 |
 | `crates/signaling` | `spuria-signaling`：WebSocket 信令、UDP 地址反射、设备/会话登记和管理 API |
 | `crates/relay` | `spuria-relay`：票据校验、连接配对、容量控制和密文转发 |
-| `crates/client` | `spuria` CLI 与 `spuria_client` 库：建链、选路、会话生命周期及 RDP 流量转发 |
+| `crates/client` | `spuria` CLI 与 `spuria_client` 库：建链、选路、会话生命周期、RDP 与 TCP 端口转发 |
 | `clients/desktop` | Tauri 桌面应用；Rust 后端位于独立工作区 `src-tauri` |
 | `crates/signaling/admin-ui` | 管理网页，构建后嵌入信令二进制 |
 | `docker` | 服务端 Dockerfile 与 Compose 配置 |
@@ -87,13 +88,14 @@ Windows 产物：
 
 ```sh
 cargo test --workspace --lib --bins --release --locked
+cargo test --manifest-path clients/desktop/src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --release --locked -- -D warnings
 cargo fmt --manifest-path clients/desktop/src-tauri/Cargo.toml -- --check
 cargo clippy --manifest-path clients/desktop/src-tauri/Cargo.toml --release --all-targets --features tauri/custom-protocol --locked -- -D warnings
 ```
 
-桌面端 Clippy 需要先完成前面的前端构建。以上命令不运行 E2E。
+桌面端单元测试和 Clippy 需要先完成前面的前端构建。以上命令不运行 E2E，桌面单元测试不会启动真实 RDP 客户端。
 
 ## 运行服务与客户端
 
@@ -137,7 +139,9 @@ spuria --secret team-secret --device-id 222222222 --data-dir data/controller con
 | `--force-relay` | 跳过 QUIC 连接尝试，强制使用中继；仍执行候选收集、交换与 UDP 打洞 | 关闭 |
 | `--no-udp` | 关闭 QUIC 数据报转发 | 未设置，即启用 UDP |
 | `host --rdp` | 被控端的 RDP 服务地址 | `127.0.0.1:3389` |
+| `host --allow-port` | 明确允许的回环 TCP 转发端口；可重复或用逗号分隔 | 空（全部拒绝） |
 | `control <peer> --listen` | 主控端的本地监听地址 | `127.0.0.1:33389` |
+| `control <peer> --forward` | 本地回环监听与远程 TCP 端口，格式 `127.0.0.1:15432=5432`；可重复 | 无映射 |
 
 ### 中继默认限制
 
@@ -163,9 +167,46 @@ npm run tauri -- dev
 
 首页提供被控和主控入口、状态及活动日志；设置页提供网络、口令、连接默认值、主题和更新操作。切换设置页会保留当前连接状态；保存的连接默认值用于后续连接，不会重配正在运行的会话。
 
+Windows 检测到系统 `mstsc` 时，主控表单默认启用 **Open Windows Remote Desktop automatically**。
+点击 **Connect** 前输入远程 Windows 用户名和密码，例如 `REMOTEPC\user` 或 `DOMAIN\user`，使用远程计算机或域的实际名称；不要把本地回环地址理解成远程账户所属计算机。
+自动打开要求本地监听绑定回环 IP，默认 `127.0.0.1:33389`。后端仅在该会话的真实 `RdpReady` 事件到达后，用实际绑定地址启动一次 `mstsc`，失败时保留手动连接地址，不自动重试。关闭开关、非 Windows 平台或 CLI 仍使用手动连接流程。
+
+RDP 用户名和密码属于本次连接，不写入 Settings 或 localStorage；提交调用结束后清空前端密码，切换目标设备、断开或客户端停止时清空两项。
+启动器用当前 Windows 用户的 DPAPI 加密密码，生成 `%APPDATA%\com.spuria.desktop\rdp-sessions\session-*.rdp` 临时文件，再将文件路径交给 `mstsc`；用户名和地址仍为文件内的明文，密码不进入进程参数。
+会话结束、断开或应用正常退出时会清理本次创建的子进程和文件；崩溃或强制终止可能留下含密文密码的临时文件。DPAPI 的用户绑定机制见 [Microsoft CryptProtectData 文档](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)。
+
+这是通过 [mstsc 的连接文件入口](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/mstsc)省去初始地址输入步骤，**不保证自动登录或所有提示消失**。
+Windows 2026 年 4 月安全更新引入了 RDP 文件打开提示；证书、凭据及组织策略也可能要求人工确认。当前 `password 51` 密码字段的兼容性和真实 MSTSC 登录仍未验收。参见 [Microsoft RDP 文件安全提示说明](https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/remotepc/understanding-security-warnings)。
+
 当前更新地址和公钥仍是占位值，不能据此认为自动更新已可用。手动更新入口已接入检查和安装；“启动时检查更新”选项尚未接入实际启动检查。MSI 打包与 updater 工件需要先配置真实发布地址、公钥和签名私钥；普通完整编译使用 `--no-bundle`。
 
 数据目录、详细构建与发布步骤见 [桌面客户端 README](clients/desktop/README.md)。
+
+### TCP 端口映射
+
+先更新**主控端、被控端和信令服务**，重新建立连接以协商转发能力。旧版本组合保留 RDP 兼容流程，界面会提示升级，不会自动启用映射。
+
+1. 被控端启动 **Allow remote control** 前，在 **Allowed TCP forwarding ports** 填写逗号分隔的端口，例如 `5432, 8080`。默认空白表示拒绝全部转发端口，最多允许 128 个不同的端口；目标仅限被控设备的 `127.0.0.1`。
+2. 主控端连接该设备。仅使用端口映射时，关闭 **Open Windows Remote Desktop automatically**，无需输入 Windows RDP 账户或打开远程桌面；信令鉴权和目标服务自身的鉴权仍然适用。
+3. 隧道协商完成后，在 **TCP Port Forwarding** 输入本地端口和远程端口，点击 **Add mapping**。例如本地 `15432`、远程 `5432`，应用即可通过主控机的 `127.0.0.1:15432` 访问被控机的 `127.0.0.1:5432`。
+
+桌面表单的端口范围均为 `1..65535`，本地只绑定 `127.0.0.1`，每个会话最多 32 个映射，RDP 与映射合计最多 128 条并发 TCP 连接。**Listening** 表示本地监听已建立；只有本地应用连接时才访问远程服务，不代表已验证白名单授权或服务可用。被拒绝或服务不可达时显示错误，映射保留以便之后再连接。
+
+**Stop** 关闭该映射的监听及活动连接，**Disconnect** 或会话结束释放全部映射。桌面端的白名单和映射只保留在当前应用内存中，不写入全局设置，也不会在重启或新会话中自动恢复映射。映射仅支持 TCP，P2P 和中继均可使用；不扩展原有 RDP UDP 转发能力。
+
+CLI 也可在启动时提供白名单和映射（仍需设置各自的信令地址、身份和凭据）：
+
+```sh
+# 被控端允许本机 TCP 5432 和 8080
+spuria --secret team-secret --device-id 111111111 --data-dir data/host host --allow-port 5432,8080
+
+# 主控端建立隧道后创建映射，不启动 RDP 客户端
+spuria --secret team-secret --device-id 222222222 --data-dir data/controller control 111111111 --forward 127.0.0.1:15432=5432
+```
+
+CLI 的本地监听还支持 IPv6 回环地址（如 `[::1]:15432=5432`），以及用端口 `0` 自动分配本地端口；实际监听地址会写入就绪日志。远端目标仍固定为被控机的 `127.0.0.1:<端口>`。
+
+端口映射尚未进行 E2E 或真实远程服务验收。
 
 ## 管理网页与 API
 
@@ -220,7 +261,13 @@ Compose 默认在宿主机所有接口发布这些端口，没有自带 TLS 反�
 
 ## 测试与验收状态
 
-代码提交 [`8880cc7`](https://github.com/ChingCdesu/Spuria/commit/8880cc7b91e50f8f233e2217233c9dda859cb2ca) 在 2026-09-26 至 2026-09-27 的验证记录：
+2026-09-29 在本机 Windows 对当前工作区（包含 Windows RDP 自动打开与 TCP 端口映射）完成的验证：
+
+- 核心 Rust 工作区全部目标的 Release 编译、桌面前端构建及 Tauri Release 可执行文件编译通过；未生成安装包或签名。
+- 71 项单元测试通过：核心工作区 61 项、桌面端 10 项。转发模块测试使用内存传输与本地测试服务，覆盖并发、8 MiB 慢速传输、半关闭、停止映射及连接意外关闭后的清理。
+- 两个 Rust 工作区的格式检查与 Clippy 检查通过；未运行 E2E、真实 MSTSC 登录或真实远程端口转发验收，也未部署本次变更。
+
+以下是代码提交 [`8880cc7`](https://github.com/ChingCdesu/Spuria/commit/8880cc7b91e50f8f233e2217233c9dda859cb2ca) 在 2026-09-26 至 2026-09-27 的历史验证记录，不覆盖随后新增的 Windows RDP 自动打开与 TCP 端口映射功能：
 
 - 本机 Windows Release 完整编译通过：核心 Rust 工作区、两个前端及 Tauri 桌面可执行文件。
 - 43 项单元测试通过；两个 Rust 工作区的格式和 Clippy 检查通过。
@@ -253,7 +300,7 @@ bash scripts/smoke-test.sh relay
 
 | 工作流 | 触发方式 | 行为 |
 |---|---|---|
-| [ci.yml](.github/workflows/ci.yml) | `main` 推送、PR、手动 | 格式与 Clippy、Linux/Windows 核心编译和单元测试、两个前端、嵌入网页一致性、Windows 桌面 Release 编译；E2E 仅手动勾选时运行 |
+| [ci.yml](.github/workflows/ci.yml) | `main` 推送、PR、手动 | 格式与 Clippy、Linux/Windows 核心编译和单元测试、两个前端、嵌入网页一致性、Windows 桌面 Release 编译与单元测试；E2E 仅手动勾选时运行 |
 | [docker.yml](.github/workflows/docker.yml) | `main` 推送、`v*` 标签、PR | 构建两个服务端镜像；推送/标签发布到 GHCR，PR 只构建；不会自动部署服务器 |
 | [release-client.yml](.github/workflows/release-client.yml) | `v*` 标签或手动 | 使用签名配置构建 Windows MSI 与 updater 工件，并创建草稿 Release；发布前需完成真实更新配置 |
 

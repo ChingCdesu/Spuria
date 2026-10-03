@@ -3,16 +3,28 @@
 
 //! Spuria desktop client (Tauri 2).
 //!
-//! The GUI drives the same [`spuria_client::app::run`] state machine as the CLI.
+//! The GUI drives the same client state machine as the CLI.
 //! A `connect` command spawns the session on Tauri's async runtime and forwards
 //! [`spuria_client::ClientEvent`]s to the frontend as `client-event` events; a
-//! `disconnect` command stops and awaits it. The system RDP bridge / IronRDP integration
-//! is unchanged from the library — the GUI is purely a front-end over it.
+//! `disconnect` command stops and awaits it. Windows controllers can launch
+//! the system RDP client after the library reports a bound local listener.
 
-use std::{net::SocketAddr, path::PathBuf};
+mod rdp_launch_state;
+mod rdp_launcher;
 
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+use rdp_launch_state::RdpLaunchCoordinator;
+use rdp_launcher::{LaunchedRdp, RdpLaunchRequest};
 use serde::{Deserialize, Serialize};
-use spuria_client::{app, AppConfig};
+use spuria_client::{app, forwarding::ForwardRule, AppConfig};
 use spuria_common::{ids::DeviceId, transport::Role};
 use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
@@ -21,15 +33,20 @@ use tokio::sync::{oneshot, Mutex};
 #[derive(Default)]
 struct AppState {
     task: Mutex<Option<RunningClient>>,
+    closing: AtomicBool,
+    next_forward_id: AtomicU64,
 }
 
 struct RunningClient {
     stop: oneshot::Sender<()>,
+    stopping: Arc<AtomicBool>,
     task: JoinHandle<()>,
+    controls: app::AppControl,
 }
 
 impl RunningClient {
     async fn shutdown(self) {
+        self.stopping.store(true, Ordering::SeqCst);
         let _ = self.stop.send(());
         let _ = self.task.await;
     }
@@ -77,6 +94,7 @@ impl Default for Settings {
 struct AppInfo {
     version: String,
     device_id: String,
+    rdp_launch_supported: bool,
 }
 
 /// Per-connection options sent from the frontend's Connect form. Global
@@ -94,6 +112,19 @@ struct ConnectOpts {
     rdp: Option<String>,
     #[serde(default)]
     force_relay: bool,
+    /// One connection only; never serialized into settings or events.
+    #[serde(default)]
+    rdp_launch: Option<RdpLaunchRequest>,
+    /// Host only: TCP services on 127.0.0.1 that this run may expose.
+    #[serde(default)]
+    allow_forward_ports: Vec<u16>,
+}
+
+#[derive(Serialize)]
+struct ForwardInfo {
+    forward_id: String,
+    listen_addr: String,
+    remote_port: u16,
 }
 
 fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -157,6 +188,7 @@ fn get_app_info(app: AppHandle) -> Result<AppInfo, String> {
     Ok(AppInfo {
         version: app.package_info().version.to_string(),
         device_id: resolve_device_id(&app, None)?,
+        rdp_launch_supported: rdp_launcher::available(),
     })
 }
 
@@ -164,15 +196,19 @@ fn get_app_info(app: AppHandle) -> Result<AppInfo, String> {
 async fn connect(
     app: AppHandle,
     state: State<'_, AppState>,
-    opts: ConnectOpts,
+    mut opts: ConnectOpts,
 ) -> Result<String, String> {
+    if state.closing.load(Ordering::SeqCst) {
+        return Err("The application is closing.".into());
+    }
     let settings = load_settings(&app)?;
     if settings.server.trim().is_empty() {
         return Err("No signaling server configured — open Settings and save first.".into());
     }
     let role = match opts.role.as_str() {
         "host" => Role::Host,
-        _ => Role::Controller,
+        "controller" => Role::Controller,
+        _ => return Err("Unknown client role.".into()),
     };
     let reflect_addr: SocketAddr = settings
         .reflect
@@ -204,10 +240,45 @@ async fn connect(
     if role == Role::Controller && peer_id.is_none() {
         return Err("controller mode requires a peer device id".into());
     }
+    app::validate_forward_ports(&opts.allow_forward_ports)?;
+    if role != Role::Host && !opts.allow_forward_ports.is_empty() {
+        return Err("Only a host can allow remote forwarding ports.".into());
+    }
+
+    // Include credential preparation in command serialization. Disconnect
+    // must not return while an earlier Connect is still preparing a late run.
+    let mut running = state.task.lock().await;
+    if state.closing.load(Ordering::SeqCst) {
+        return Err("The application is closing.".into());
+    }
+    let prepared_rdp = if let Some(request) = opts.rdp_launch.take() {
+        if role != Role::Controller {
+            return Err("Automatic Remote Desktop is only available in controller mode.".into());
+        }
+        if !listen_addr.ip().is_loopback() {
+            return Err(
+                "Automatic Remote Desktop requires a loopback listener, such as 127.0.0.1:33389."
+                    .into(),
+            );
+        }
+        Some(
+            tokio::task::spawn_blocking(move || rdp_launcher::prepare(request))
+                .await
+                .map_err(|_| "Could not prepare Remote Desktop credentials.".to_string())??,
+        )
+    } else {
+        None
+    };
+    let run_data_dir = data_dir(&app)?;
+    let expected_peer = peer_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
 
     // Event forwarding is owned by the same task as the client, so an old
     // connection cannot emit stale events after its replacement starts.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (controls, control_rx) = app::control_channel();
 
     let cfg = AppConfig {
         role,
@@ -218,31 +289,55 @@ async fn connect(
         peer_id,
         rdp_addr,
         listen_addr,
-        data_dir: data_dir(&app)?,
+        data_dir: run_data_dir.clone(),
         force_relay: opts.force_relay,
         enable_udp: settings.enable_udp,
         events: Some(tx),
+        allow_forward_ports: opts.allow_forward_ports,
+        initial_forwards: Vec::new(),
+        controls: Some(control_rx),
     };
 
     // Serialize replacement and disconnect through the whole shutdown. The
     // command returns only after previous RDP listeners/bridges have stopped.
-    let mut running = state.task.lock().await;
+    if state.closing.load(Ordering::SeqCst) {
+        return Err("The application is closing.".into());
+    }
     if let Some(previous) = running.take() {
         previous.shutdown().await;
     }
     let (stop, stopped) = oneshot::channel();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let native_stop = stopping.clone();
     let app_for_run = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
+        let launcher = prepared_rdp.map(|prepared| {
+            Arc::new(move |address| prepared.launch(&run_data_dir, address))
+                as Arc<dyn Fn(SocketAddr) -> Result<LaunchedRdp, String> + Send + Sync>
+        });
+        let mut native =
+            RdpLaunchCoordinator::new(expected_peer, listen_addr, native_stop, launcher);
         let run = app::run_until_shutdown(cfg, async {
             let _ = stopped.await;
         });
         tokio::pin!(run);
         let result = loop {
             tokio::select! {
+                biased;
                 result = &mut run => break result,
-                Some(ev) = rx.recv() => { let _ = app_for_run.emit("client-event", ev); }
+                Some(ev) = rx.recv() => {
+                    // Display the readiness event before reporting launch results.
+                    let _ = app_for_run.emit("client-event", &ev);
+                    if let Some(result) = native.on_event(&ev) {
+                        let _ = app_for_run.emit("rdp-launch", result);
+                    }
+                }
+                event = native.next_event() => { let _ = app_for_run.emit("rdp-launch", event); }
             }
         };
+        native.shutdown().await;
+        // The client has exited. Queued readiness events are display-only and
+        // must never authorize another process launch during this final drain.
         while let Ok(ev) = rx.try_recv() {
             let _ = app_for_run.emit("client-event", ev);
         }
@@ -251,7 +346,12 @@ async fn connect(
         }
         let _ = app_for_run.emit("client-stopped", ());
     });
-    *running = Some(RunningClient { stop, task: handle });
+    *running = Some(RunningClient {
+        stop,
+        stopping,
+        task: handle,
+        controls,
+    });
 
     Ok(device_id)
 }
@@ -263,6 +363,68 @@ async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
         client.shutdown().await;
     }
     Ok(())
+}
+
+/// Clone the handle for this particular client run. Releasing the task lock
+/// before waiting lets Disconnect cancel a pending command and drain sockets.
+async fn forwarding_control(state: &AppState) -> Result<app::AppControl, String> {
+    let running = state.task.lock().await;
+    if state.closing.load(Ordering::SeqCst) {
+        return Err("The application is closing.".into());
+    }
+    let client = running
+        .as_ref()
+        .filter(|client| !client.stopping.load(Ordering::SeqCst))
+        .ok_or_else(|| "Connect to a remote device before forwarding a port.".to_string())?;
+    Ok(client.controls.clone())
+}
+
+#[tauri::command]
+async fn start_port_forward(
+    state: State<'_, AppState>,
+    session_id: String,
+    listen_addr: String,
+    remote_port: u16,
+) -> Result<ForwardInfo, String> {
+    let listen_addr: SocketAddr = listen_addr
+        .trim()
+        .parse()
+        .map_err(|_| "Enter a local loopback address, such as 127.0.0.1:8080.".to_string())?;
+    if !listen_addr.ip().is_loopback() || listen_addr.port() == 0 || remote_port == 0 {
+        return Err("Use a loopback listener and ports between 1 and 65535.".into());
+    }
+    let controls = forwarding_control(&state).await?;
+    let forward_id = format!(
+        "forward-{}",
+        state.next_forward_id.fetch_add(1, Ordering::Relaxed)
+    );
+    let bound = controls
+        .start(
+            session_id,
+            ForwardRule {
+                id: forward_id.clone(),
+                listen_addr,
+                remote_port,
+            },
+        )
+        .await?;
+    Ok(ForwardInfo {
+        forward_id,
+        listen_addr: bound.to_string(),
+        remote_port,
+    })
+}
+
+#[tauri::command]
+async fn stop_port_forward(
+    state: State<'_, AppState>,
+    session_id: String,
+    forward_id: String,
+) -> Result<(), String> {
+    forwarding_control(&state)
+        .await?
+        .stop(session_id, forward_id)
+        .await
 }
 
 /// Check the configured update endpoint and install if a newer version exists.
@@ -294,8 +456,30 @@ fn main() {
             save_settings,
             connect,
             disconnect,
+            start_port_forward,
+            stop_port_forward,
             check_update
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Spuria desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Spuria desktop")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
+                api.prevent_exit();
+                let state = app.state::<AppState>();
+                if !state.closing.swap(true, Ordering::SeqCst) {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<AppState>();
+                        let mut running = state.task.lock().await;
+                        if let Some(client) = running.take() {
+                            client.shutdown().await;
+                        }
+                        app.exit(0);
+                    });
+                }
+            }
+        });
 }

@@ -7,6 +7,7 @@
 pub mod app;
 pub mod candidates;
 pub mod certs;
+pub mod forwarding;
 pub mod rdp;
 pub mod signaling_client;
 pub mod tunnel;

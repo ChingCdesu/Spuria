@@ -9,7 +9,7 @@ pub mod relay;
 
 use anyhow::Result;
 use spuria_common::transport::{Role, TunnelPath};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub enum Tunnel {
     Quic(quic::QuicTunnel),
@@ -36,7 +36,10 @@ impl Tunnel {
 
     /// Bridge the tunnel's reliable channel with a local TCP stream until either
     /// side closes. `role` decides who opens vs. accepts the QUIC stream.
-    pub async fn bridge(self, local: TcpStream, role: Role) -> Result<()> {
+    pub async fn bridge<S>(self, local: S, role: Role) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         match self {
             Tunnel::Quic(t) => t.bridge(local, role).await,
             Tunnel::Relay(t) => t.bridge(local, role).await,

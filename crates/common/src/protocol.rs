@@ -190,6 +190,7 @@ mod tests {
                 "127.0.0.1:5".parse().unwrap(),
             )],
             quic_cert_fp: "ab".into(),
+            tcp_forwarding_v1: true,
         };
         let m = ServerMsg::Candidates {
             session_id: "s".into(),

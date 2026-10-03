@@ -15,7 +15,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Plaintext read size per encrypted frame (kept under [`MAX_PLAINTEXT_CHUNK`]).
@@ -70,9 +70,12 @@ pub async fn connect(
 }
 
 impl RelayTunnel {
-    pub async fn bridge(self, local: TcpStream, _role: Role) -> Result<()> {
+    pub async fn bridge<S>(self, local: S, _role: Role) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let (mut relay_r, mut relay_w) = self.tcp.into_split();
-        let (mut local_r, mut local_w) = local.into_split();
+        let (mut local_r, mut local_w) = tokio::io::split(local);
         // Crypto ops are sync and fast; the lock is never held across an await.
         let session = Arc::new(Mutex::new(self.session));
 

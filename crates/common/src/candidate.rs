@@ -60,6 +60,20 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<Candidate>(&json).unwrap(), c);
     }
+
+    #[test]
+    fn forwarding_capability_defaults_to_legacy_and_survives_roundtrip() {
+        let legacy: SessionOffer =
+            serde_json::from_str(r#"{"candidates":[],"quic_cert_fp":"legacy"}"#).unwrap();
+        assert!(!legacy.tcp_forwarding_v1);
+        let modern = SessionOffer {
+            tcp_forwarding_v1: true,
+            ..legacy
+        };
+        let encoded = serde_json::to_string(&modern).unwrap();
+        let decoded: SessionOffer = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.tcp_forwarding_v1);
+    }
 }
 
 /// Everything one peer needs to attempt a direct connection to the other:
@@ -69,4 +83,8 @@ pub struct SessionOffer {
     pub candidates: Vec<Candidate>,
     /// SHA-256 (hex) of the peer's self-signed QUIC certificate DER.
     pub quic_cert_fp: String,
+    /// Both offers must retain this flag to use the multiplexed TCP-forwarding
+    /// protocol. Old peers/servers omit it, selecting the legacy RDP bridge.
+    #[serde(default)]
+    pub tcp_forwarding_v1: bool,
 }

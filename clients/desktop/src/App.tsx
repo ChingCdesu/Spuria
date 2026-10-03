@@ -60,6 +60,7 @@ export default function App() {
                 <Home
                   settings={settings}
                   deviceId={info?.device_id ?? "…"}
+                  rdpLaunchSupported={info?.rdp_launch_supported ?? false}
                   onOpenSettings={() => setTab("settings")}
                 />
               </div>

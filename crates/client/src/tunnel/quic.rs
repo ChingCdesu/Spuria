@@ -23,8 +23,8 @@ use spuria_common::{crypto::cert_fingerprint, transport::Role};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::{sync::Arc, time::Duration};
-use tokio::io::{copy, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{copy, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::certs::SelfSignedCert;
@@ -80,7 +80,10 @@ impl QuicTunnel {
         self.conn.clone()
     }
 
-    pub async fn bridge(self, local: TcpStream, role: Role) -> Result<()> {
+    pub async fn bridge<S>(self, local: S, role: Role) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         // The controller opens the primary bi-stream; the host accepts it.
         let (mut send, mut recv) = if role.is_initiator() {
             self.conn.open_bi().await.context("opening bi stream")?
@@ -88,7 +91,7 @@ impl QuicTunnel {
             self.conn.accept_bi().await.context("accepting bi stream")?
         };
 
-        let (mut lr, mut lw) = local.into_split();
+        let (mut lr, mut lw) = tokio::io::split(local);
         let up = async move {
             copy(&mut lr, &mut send).await?;
             let _ = send.finish();

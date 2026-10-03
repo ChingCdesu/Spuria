@@ -14,9 +14,17 @@ use spuria_common::{
     transport::Role,
 };
 use std::{
-    collections::HashMap, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+    collections::{HashMap, HashSet},
+    future::Future,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -24,6 +32,7 @@ use tracing::{debug, info, warn};
 use crate::{
     candidates, certs,
     certs::SelfSignedCert,
+    forwarding::{self, ForwardCommand, ForwardEvent, ForwardHandle, ForwardRule},
     rdp,
     signaling_client::{self, RegisterInfo, SignalingHandle},
     tunnel::{quic, relay, Tunnel},
@@ -55,6 +64,25 @@ pub enum ClientEvent {
         session_id: String,
         rdp_addr: String,
     },
+    PortForwardingAvailable {
+        session_id: String,
+        available: bool,
+    },
+    PortForwardStarted {
+        session_id: String,
+        forward_id: String,
+        listen_addr: String,
+        remote_port: u16,
+    },
+    PortForwardStopped {
+        session_id: String,
+        forward_id: String,
+    },
+    PortForwardError {
+        session_id: String,
+        forward_id: String,
+        message: String,
+    },
     SessionEnded {
         session_id: String,
         error: Option<String>,
@@ -84,6 +112,113 @@ pub struct AppConfig {
     pub enable_udp: bool,
     /// Optional channel for UI status events.
     pub events: Option<UnboundedSender<ClientEvent>>,
+    /// Host only: explicitly permitted remote loopback TCP ports.
+    pub allow_forward_ports: Vec<u16>,
+    /// Controller only: rules to start once the forwarding mux is ready.
+    pub initial_forwards: Vec<ForwardRule>,
+    /// Optional bounded UI/automation control receiver, owned by this run.
+    pub controls: Option<AppControlReceiver>,
+}
+
+const CONTROL_CAPACITY: usize = 32;
+const FORWARD_PENDING: u8 = 0;
+const FORWARD_LEGACY: u8 = 1;
+const FORWARD_READY: u8 = 2;
+
+enum ControlCommand {
+    Start {
+        session_id: SessionId,
+        rule: ForwardRule,
+        reply: oneshot::Sender<std::result::Result<SocketAddr, String>>,
+    },
+    Stop {
+        session_id: SessionId,
+        id: String,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+}
+
+/// Commands are scoped to a specific running app and session. A handle from a
+/// disconnected run cannot address a later run, even if a device ID is reused.
+#[derive(Clone)]
+pub struct AppControl {
+    sender: mpsc::Sender<ControlCommand>,
+}
+
+pub struct AppControlReceiver(mpsc::Receiver<ControlCommand>);
+
+pub fn control_channel() -> (AppControl, AppControlReceiver) {
+    let (sender, receiver) = mpsc::channel(CONTROL_CAPACITY);
+    (AppControl { sender }, AppControlReceiver(receiver))
+}
+
+impl AppControl {
+    pub async fn start(
+        &self,
+        session_id: SessionId,
+        rule: ForwardRule,
+    ) -> std::result::Result<SocketAddr, String> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .try_send(ControlCommand::Start {
+                session_id,
+                rule,
+                reply,
+            })
+            .map_err(|error| format!("forwarding command unavailable: {error}"))?;
+        response
+            .await
+            .map_err(|_| "forwarding session ended before the command completed".to_string())?
+    }
+
+    pub async fn stop(&self, session_id: SessionId, id: String) -> std::result::Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .try_send(ControlCommand::Stop {
+                session_id,
+                id,
+                reply,
+            })
+            .map_err(|error| format!("forwarding command unavailable: {error}"))?;
+        response
+            .await
+            .map_err(|_| "forwarding session ended before the command completed".to_string())?
+    }
+}
+
+/// Validate before connecting to signaling or writing local device state.
+pub fn validate_forward_ports(ports: &[u16]) -> std::result::Result<(), String> {
+    if ports.len() > 128 {
+        return Err("at most 128 allowed forwarding ports may be configured".into());
+    }
+    let mut seen = HashSet::new();
+    for &port in ports {
+        if port == 0 {
+            return Err("allowed forwarding ports must be nonzero".into());
+        }
+        if !seen.insert(port) {
+            return Err(format!("duplicate allowed forwarding port {port}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_forward_rule(rule: &ForwardRule) -> std::result::Result<(), String> {
+    forwarding::validate_rule(rule)
+}
+
+fn validate_initial_forwards(rules: &[ForwardRule]) -> std::result::Result<(), String> {
+    if rules.len() > 32 {
+        return Err("at most 32 forwarding rules may be configured".into());
+    }
+    let mut ids = HashSet::new();
+    for rule in rules {
+        validate_forward_rule(rule)?;
+        if !ids.insert(&rule.id) {
+            return Err(format!("duplicate forwarding rule ID {}", rule.id));
+        }
+    }
+    Ok(())
 }
 
 /// Shared, immutable-ish context handed to every session task.
@@ -98,6 +233,8 @@ struct Ctx {
     force_relay: bool,
     enable_udp: bool,
     events: Option<UnboundedSender<ClientEvent>>,
+    allow_forward_ports: Vec<u16>,
+    initial_forwards: Vec<ForwardRule>,
 }
 
 impl Ctx {
@@ -115,16 +252,124 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 struct SessionControl {
     messages: UnboundedSender<ServerMsg>,
     stop: Option<oneshot::Sender<()>>,
+    forwarding: ForwardHandle,
+    forwarding_status: Arc<AtomicU8>,
+}
+
+struct SessionForwarding {
+    handle: ForwardHandle,
+    commands: mpsc::Receiver<ForwardCommand>,
+    status: Arc<AtomicU8>,
+}
+
+fn route_control(
+    role: Role,
+    sessions: &HashMap<SessionId, SessionControl>,
+    command: ControlCommand,
+    emit: impl Fn(ClientEvent),
+) {
+    let (session_id, command) = match command {
+        ControlCommand::Start {
+            session_id,
+            rule,
+            reply,
+        } => (session_id, ForwardCommand::Start { rule, reply }),
+        ControlCommand::Stop {
+            session_id,
+            id,
+            reply,
+        } => (session_id, ForwardCommand::Stop { id, reply }),
+    };
+    let cancelled = match &command {
+        ForwardCommand::Start { reply, .. } => reply.is_closed(),
+        ForwardCommand::Stop { reply, .. } => reply.is_closed(),
+    };
+    if cancelled {
+        return;
+    }
+    let rejection = if role != Role::Controller {
+        Some("only controllers can create or stop forwarding rules".to_string())
+    } else if let Some(session) = sessions.get(&session_id) {
+        if session.stop.is_none() {
+            Some("forwarding session is stopping".to_string())
+        } else {
+            match session.forwarding_status.load(Ordering::Acquire) {
+                FORWARD_READY => None,
+                FORWARD_LEGACY => {
+                    Some("peer or signaling server does not support TCP forwarding".to_string())
+                }
+                _ => Some("forwarding session is not ready".to_string()),
+            }
+        }
+    } else {
+        Some("forwarding session is no longer active".to_string())
+    };
+    let rejection = rejection.or_else(|| match &command {
+        ForwardCommand::Start { rule, .. } => validate_forward_rule(rule).err(),
+        ForwardCommand::Stop { .. } => None,
+    });
+    if let Some(message) = rejection {
+        reject_forward_command(session_id, command, message, emit);
+        return;
+    }
+    let session = sessions.get(&session_id).expect("validated active session");
+    if let Err(error) = session.forwarding.try_send(command) {
+        let (command, message) = match error {
+            mpsc::error::TrySendError::Full(command) => {
+                (command, "forwarding command queue is full")
+            }
+            mpsc::error::TrySendError::Closed(command) => (command, "forwarding session has ended"),
+        };
+        reject_forward_command(session_id, command, message.to_string(), emit);
+    }
+}
+
+fn reject_forward_command(
+    session_id: SessionId,
+    command: ForwardCommand,
+    message: String,
+    emit: impl Fn(ClientEvent),
+) {
+    match command {
+        ForwardCommand::Start { rule, reply } => {
+            emit(ClientEvent::PortForwardError {
+                session_id,
+                forward_id: rule.id,
+                message: message.clone(),
+            });
+            let _ = reply.send(Err(message));
+        }
+        ForwardCommand::Stop { id, reply } => {
+            emit(ClientEvent::PortForwardError {
+                session_id,
+                forward_id: id,
+                message: message.clone(),
+            });
+            let _ = reply.send(Err(message));
+        }
+    }
 }
 
 /// Run until the supplied shutdown future resolves, then release and await all
 /// sessions and signaling tasks before returning. Dropping the future also
 /// aborts its owned task groups as a last-resort cancellation guard.
-pub async fn run_until_shutdown(cfg: AppConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
+pub async fn run_until_shutdown(
+    mut cfg: AppConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     tokio::pin!(shutdown);
     if cfg.role == Role::Controller && cfg.peer_id.is_none() {
         bail!("controller requires a --peer id");
     }
+    validate_forward_ports(&cfg.allow_forward_ports).map_err(anyhow::Error::msg)?;
+    if cfg.role == Role::Controller && !cfg.allow_forward_ports.is_empty() {
+        bail!("allowed forwarding ports apply only to the host role");
+    }
+    if cfg.role == Role::Host && !cfg.initial_forwards.is_empty() {
+        bail!("initial forwarding rules apply only to the controller role");
+    }
+    validate_initial_forwards(&cfg.initial_forwards).map_err(anyhow::Error::msg)?;
+    let mut controls = cfg.controls.take();
     // Install the ring crypto provider for rustls/QUIC (idempotent across calls).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -166,6 +411,8 @@ pub async fn run_until_shutdown(cfg: AppConfig, shutdown: impl Future<Output = (
         force_relay: cfg.force_relay,
         enable_udp: cfg.enable_udp,
         events: cfg.events.clone(),
+        allow_forward_ports: cfg.allow_forward_ports,
+        initial_forwards: cfg.initial_forwards,
     });
 
     let mut sessions: HashMap<SessionId, SessionControl> = HashMap::new();
@@ -177,6 +424,18 @@ pub async fn run_until_shutdown(cfg: AppConfig, shutdown: impl Future<Output = (
         let msg = tokio::select! {
             biased;
             _ = &mut shutdown => break,
+            command = async {
+                match &mut controls {
+                    Some(receiver) => receiver.0.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match command {
+                    Some(command) => route_control(ctx.role, &sessions, command, |event| ctx.emit(event)),
+                    None => controls = None,
+                }
+                continue;
+            }
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Ok(sid)) = completed {
                     sessions.remove(&sid);
@@ -235,18 +494,33 @@ pub async fn run_until_shutdown(cfg: AppConfig, shutdown: impl Future<Output = (
                 }
                 let (tx, rx) = unbounded_channel();
                 let (stop, stopped) = oneshot::channel();
+                let (forwarding_handle, forwarding_commands) = forwarding::command_channel();
+                let forwarding_status = Arc::new(AtomicU8::new(FORWARD_PENDING));
                 sessions.insert(
                     session_id.clone(),
                     SessionControl {
                         messages: tx,
                         stop: Some(stop),
+                        forwarding: forwarding_handle.clone(),
+                        forwarding_status: forwarding_status.clone(),
                     },
                 );
                 let ctx = ctx.clone();
                 let sid = session_id.clone();
                 tasks.spawn(async move {
                     let res = until_stopped(
-                        run_session(ctx.clone(), sid.clone(), peer_id, peer_noise_pubkey, rx),
+                        run_session(
+                            ctx.clone(),
+                            sid.clone(),
+                            peer_id,
+                            peer_noise_pubkey,
+                            rx,
+                            SessionForwarding {
+                                handle: forwarding_handle,
+                                commands: forwarding_commands,
+                                status: forwarding_status,
+                            },
+                        ),
                         stopped,
                     )
                     .await;
@@ -338,6 +612,7 @@ async fn run_session(
     peer_id: DeviceId,
     peer_pubkey_hex: String,
     mut rx: UnboundedReceiver<ServerMsg>,
+    forwarding: SessionForwarding,
 ) -> Result<()> {
     let peer_pubkey = hex::decode(&peer_pubkey_hex).context("decoding peer noise pubkey")?;
     ctx.emit(ClientEvent::SessionStarted {
@@ -357,6 +632,7 @@ async fn run_session(
         offer: SessionOffer {
             candidates: gathered.candidates.clone(),
             quic_cert_fp: ctx.cert.fingerprint.clone(),
+            tcp_forwarding_v1: true,
         },
     });
 
@@ -368,6 +644,9 @@ async fn run_session(
     .await
     .context("awaiting peer candidates")?;
     let peer_addrs: Vec<SocketAddr> = peer_offer.candidates.iter().map(|c| c.addr).collect();
+    // We advertised support above; an old peer or a server that strips the
+    // new field safely selects the original RDP wire format on both sides.
+    let supports_forwarding = peer_offer.tcp_forwarding_v1;
     info!(%session_id, %peer_id, ?peer_addrs, "received peer candidates");
 
     // 4. Punch open the NAT mappings.
@@ -448,7 +727,87 @@ async fn run_session(
         path: format!("{:?}", tunnel.path()).to_lowercase(),
     });
 
-    // 7. Bridge RDP for our role.
+    // 7. New peers multiplex persistent RDP and explicitly permitted TCP
+    // forwarding. Closing a local RDP client does not end this session.
+    if supports_forwarding {
+        return match ctx.role {
+            Role::Host => {
+                ctx.emit(ClientEvent::HostBridging {
+                    session_id: session_id.clone(),
+                    rdp_addr: ctx.rdp_addr.to_string(),
+                });
+                forwarding::serve_host(
+                    tunnel,
+                    ctx.rdp_addr,
+                    ctx.enable_udp,
+                    ctx.allow_forward_ports.clone(),
+                )
+                .await
+            }
+            Role::Controller => {
+                let SessionForwarding {
+                    handle,
+                    commands,
+                    status,
+                } = forwarding;
+                let (ready, ready_rx) = oneshot::channel();
+                let serve = forwarding::serve_controller(
+                    tunnel,
+                    ctx.listen_addr,
+                    ctx.enable_udp,
+                    commands,
+                    |addr| {
+                        info!(%session_id, "RDP tunnel READY — point your RDP client (mstsc) at {addr}");
+                        status.store(FORWARD_READY, Ordering::Release);
+                        ctx.emit(ClientEvent::PortForwardingAvailable {
+                            session_id: session_id.clone(),
+                            available: true,
+                        });
+                        ctx.emit(ClientEvent::RdpReady {
+                            session_id: session_id.clone(),
+                            listen_addr: addr.to_string(),
+                        });
+                        let _ = ready.send(());
+                    },
+                    |event| emit_forward_event(&ctx, &session_id, event),
+                );
+                let initial = async {
+                    if ready_rx.await.is_ok() {
+                        for rule in &ctx.initial_forwards {
+                            match handle.start(rule.clone()).await {
+                                Ok(listen_addr) => {
+                                    info!(%session_id, forward_id = %rule.id, %listen_addr, remote_port = rule.remote_port, "TCP forwarding listener ready")
+                                }
+                                Err(message) => {
+                                    warn!(%session_id, forward_id = %rule.id, %message, "initial forwarding rule failed")
+                                }
+                            }
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+                tokio::try_join!(serve, initial).map(|_| ())
+            }
+        };
+    }
+
+    forwarding.status.store(FORWARD_LEGACY, Ordering::Release);
+    if ctx.role == Role::Controller {
+        ctx.emit(ClientEvent::PortForwardingAvailable {
+            session_id: session_id.clone(),
+            available: false,
+        });
+        for rule in &ctx.initial_forwards {
+            let message = "peer or signaling server does not support TCP forwarding".to_string();
+            warn!(%session_id, forward_id = %rule.id, %message, "initial forwarding rule rejected");
+            ctx.emit(ClientEvent::PortForwardError {
+                session_id: session_id.clone(),
+                forward_id: rule.id.clone(),
+                message,
+            });
+        }
+    }
+    // Legacy peers retain the original single-RDP-stream behavior.
     match ctx.role {
         Role::Host => {
             ctx.emit(ClientEvent::HostBridging {
@@ -467,6 +826,34 @@ async fn run_session(
             .await
         }
     }
+}
+
+fn emit_forward_event(ctx: &Ctx, session_id: &str, event: ForwardEvent) {
+    let session_id = session_id.to_string();
+    ctx.emit(match event {
+        ForwardEvent::Ready {
+            id,
+            listen_addr,
+            remote_port,
+        } => ClientEvent::PortForwardStarted {
+            session_id,
+            forward_id: id,
+            listen_addr: listen_addr.to_string(),
+            remote_port,
+        },
+        ForwardEvent::Stopped { id } => ClientEvent::PortForwardStopped {
+            session_id,
+            forward_id: id,
+        },
+        ForwardEvent::Error { id, message } => {
+            warn!(%session_id, forward_id = %id, %message, "TCP forwarding error");
+            ClientEvent::PortForwardError {
+                session_id,
+                forward_id: id,
+                message,
+            }
+        }
+    });
 }
 
 /// Request a relay ticket from signaling and connect the encrypted relay tunnel.
@@ -520,6 +907,170 @@ async fn wait_for<T>(
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    fn rule(id: &str) -> ForwardRule {
+        ForwardRule {
+            id: id.to_string(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            remote_port: 8080,
+        }
+    }
+
+    fn controlled_session(status: u8) -> (SessionControl, mpsc::Receiver<ForwardCommand>) {
+        let (messages, _) = unbounded_channel();
+        let (stop, _) = oneshot::channel();
+        let (forwarding, commands) = forwarding::command_channel();
+        (
+            SessionControl {
+                messages,
+                stop: Some(stop),
+                forwarding,
+                forwarding_status: Arc::new(AtomicU8::new(status)),
+            },
+            commands,
+        )
+    }
+
+    #[test]
+    fn validates_host_allowlist_and_controller_rule_boundaries() {
+        assert!(validate_forward_ports(&[]).is_ok());
+        assert!(validate_forward_ports(&[22, 8080, 65535]).is_ok());
+        assert!(validate_forward_ports(&[0]).is_err());
+        assert!(validate_forward_ports(&[22, 22]).is_err());
+        assert!(validate_forward_ports(&(1..=129).collect::<Vec<_>>()).is_err());
+        assert!(validate_initial_forwards(&[rule("first")]).is_ok());
+        assert!(validate_initial_forwards(&[rule("same"), rule("same")]).is_err());
+        assert!(validate_initial_forwards(
+            &(0..33)
+                .map(|n| rule(&format!("rule-{n}")))
+                .collect::<Vec<_>>()
+        )
+        .is_err());
+        let mut bad = rule("valid");
+        bad.listen_addr = "0.0.0.0:8080".parse().unwrap();
+        assert!(validate_forward_rule(&bad).is_err());
+        assert!(validate_forward_rule(&rule("../invalid")).is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarding_commands_reject_stale_host_pending_and_legacy_sessions() {
+        for (role, status, id, expected) in [
+            (Role::Controller, FORWARD_READY, "stale", "no longer active"),
+            (Role::Host, FORWARD_READY, "current", "only controllers"),
+            (Role::Controller, FORWARD_PENDING, "current", "not ready"),
+            (
+                Role::Controller,
+                FORWARD_LEGACY,
+                "current",
+                "does not support",
+            ),
+        ] {
+            let (session, mut commands) = controlled_session(status);
+            let mut sessions = HashMap::new();
+            sessions.insert("current".into(), session);
+            let (reply, response) = oneshot::channel();
+            let events = std::cell::RefCell::new(Vec::new());
+            route_control(
+                role,
+                &sessions,
+                ControlCommand::Start {
+                    session_id: id.into(),
+                    rule: rule("rule"),
+                    reply,
+                },
+                |e| events.borrow_mut().push(e),
+            );
+            assert!(response.await.unwrap().unwrap_err().contains(expected));
+            assert!(commands.try_recv().is_err());
+            assert!(
+                matches!(&events.borrow()[0], ClientEvent::PortForwardError { session_id, .. } if session_id == id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_commands_are_not_forwarded_and_disconnected_handles_fail() {
+        let (session, mut commands) = controlled_session(FORWARD_READY);
+        let mut sessions = HashMap::new();
+        sessions.insert("current".into(), session);
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        route_control(
+            Role::Controller,
+            &sessions,
+            ControlCommand::Start {
+                session_id: "current".into(),
+                rule: rule("cancelled"),
+                reply,
+            },
+            |_| panic!("cancelled command emitted an event"),
+        );
+        assert!(commands.try_recv().is_err());
+        let (old_handle, receiver) = control_channel();
+        drop(receiver);
+        assert!(old_handle
+            .start("current".into(), rule("old"))
+            .await
+            .is_err());
+        assert!(old_handle
+            .stop("current".into(), "old".into())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn ready_session_commands_are_fifo_and_stopping_sessions_reject_new_rules() {
+        let (session, mut commands) = controlled_session(FORWARD_READY);
+        let mut sessions = HashMap::new();
+        sessions.insert("current".into(), session);
+        let (start_reply, start_response) = oneshot::channel();
+        let (stop_reply, stop_response) = oneshot::channel();
+        route_control(
+            Role::Controller,
+            &sessions,
+            ControlCommand::Start {
+                session_id: "current".into(),
+                rule: rule("ordered"),
+                reply: start_reply,
+            },
+            |_| {},
+        );
+        route_control(
+            Role::Controller,
+            &sessions,
+            ControlCommand::Stop {
+                session_id: "current".into(),
+                id: "ordered".into(),
+                reply: stop_reply,
+            },
+            |_| {},
+        );
+        let ForwardCommand::Start { rule, reply } = commands.recv().await.unwrap() else {
+            panic!("start must precede stop");
+        };
+        reply.send(Ok(rule.listen_addr)).unwrap();
+        assert!(start_response.await.unwrap().is_ok());
+        let ForwardCommand::Stop { id, reply } = commands.recv().await.unwrap() else {
+            panic!("expected stop");
+        };
+        assert_eq!(id, "ordered");
+        reply.send(Ok(())).unwrap();
+        assert!(stop_response.await.unwrap().is_ok());
+        sessions.get_mut("current").unwrap().stop = None;
+        let (reply, response) = oneshot::channel();
+        route_control(
+            Role::Controller,
+            &sessions,
+            ControlCommand::Stop {
+                session_id: "current".into(),
+                id: "ordered".into(),
+                reply,
+            },
+            |_| {},
+        );
+        assert!(response.await.unwrap().unwrap_err().contains("stopping"));
+        assert!(commands.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn cancellation_releases_listener_before_completion() {

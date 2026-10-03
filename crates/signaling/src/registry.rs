@@ -512,10 +512,17 @@ mod tests {
         let offer = SessionOffer {
             candidates: vec![],
             quic_cert_fp: "fp".into(),
+            tcp_forwarding_v1: true,
         };
         r.forward_candidates(&controller, &session_id, offer);
         match hrx.recv().await.unwrap() {
-            ServerMsg::Candidates { session_id: s, .. } => assert_eq!(s, session_id),
+            ServerMsg::Candidates {
+                session_id: s,
+                offer,
+            } => {
+                assert_eq!(s, session_id);
+                assert!(offer.tcp_forwarding_v1);
+            }
             other => panic!("expected candidates, got {other:?}"),
         }
 
@@ -620,6 +627,19 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         };
         hrx.recv().await.unwrap();
+        r.forward_candidates(
+            &DeviceId::new("outsider"),
+            &sid,
+            SessionOffer {
+                candidates: vec![],
+                quic_cert_fp: "injected".into(),
+                tcp_forwarding_v1: true,
+            },
+        );
+        assert!(
+            hrx.try_recv().is_err(),
+            "nonparticipant candidate injection was forwarded"
+        );
         r.close_session(&DeviceId::new("outsider"), &sid);
         r.record_path(&DeviceId::new("outsider"), &sid, TunnelPath::Relay);
         assert_eq!(r.session_count(), 1);
